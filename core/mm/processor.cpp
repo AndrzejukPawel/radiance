@@ -59,10 +59,9 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
     max_frame_rows = (int32_t)rad_meta_geti(&m, "video_preprocessor.max_video_tokens", 768);
     read_triple(m, "preprocessor.image_mean", mean);
     read_triple(m, "preprocessor.image_std", stdv);
-    if (image_min_pixels <= 0 || image_max_pixels < image_min_pixels || video_min_pixels <= 0 ||
-        video_max_pixels < video_min_pixels || !(fps > 0.0) || min_frames < 1 ||
-        max_frames < min_frames) {
-        if (why) *why = "the container's preprocessor configuration is inconsistent";
+    std::string bad;
+    if (check(&bad) < 0) {
+        if (why) *why = "the container's preprocessor configuration is inconsistent: " + bad;
         return RAD_E_INVAL;
     }
     for (int c = 0; c < 3; ++c)
@@ -70,6 +69,27 @@ int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
             if (why) *why = "preprocessor.image_std must be positive";
             return RAD_E_INVAL;
         }
+    return RAD_OK;
+}
+
+int VisionConfig::check(std::string* why) const {
+    auto no = [why](const std::string& w) {
+        if (why) *why = w;
+        return RAD_E_INVAL;
+    };
+    if (image_min_pixels <= 0) return no("image_min_pixels must be positive");
+    if (image_max_pixels < image_min_pixels)
+        return no("image_max_pixels " + std::to_string(image_max_pixels) + " is below image_min_pixels " +
+                  std::to_string(image_min_pixels));
+    if (video_min_pixels <= 0) return no("video_min_pixels must be positive");
+    if (video_max_pixels < video_min_pixels)
+        return no("video_max_pixels " + std::to_string(video_max_pixels) + " is below video_min_pixels " +
+                  std::to_string(video_min_pixels));
+    if (!(fps > 0.0)) return no("fps must be positive");
+    if (min_frames < 1) return no("min_frames must be at least 1");
+    if (max_frames < min_frames)
+        return no("max_frames " + std::to_string(max_frames) + " is below min_frames " +
+                  std::to_string(min_frames));
     return RAD_OK;
 }
 

@@ -640,11 +640,11 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
 
                 std::vector<G> req_arms, opt_arms;
                 for (const auto& [pname, pschema] : properties.items()) {
-                    /* An optional argument no value satisfies -- `false`, or `{"not": {}}`, an
-                     * Arktype or TypeBox `never` -- is one no call writes, so it gets no arm; a
-                     * model that writes it anyway reaches the undeclared arm below. The template
-                     * path does the same (vendor/patches/0012); required, it goes through the
-                     * schema and is refused there by name. */
+                    /* An optional argument no value satisfies -- `false`, or the `not` of a schema
+                     * every value satisfies, an Arktype or TypeBox `never` -- is one no call
+                     * writes, so it gets no arm; a model that writes it anyway reaches the
+                     * undeclared arm below. The template path does the same (vendor/patches/0012,
+                     * 0014); required, it goes through the schema and is refused there by name. */
                     if (!required.count(pname) && info.unsatisfiable(pschema)) continue;
                     G value;
                     if (f.other_value != ChatValue::Json || info.resolves_to_string(pschema)) {

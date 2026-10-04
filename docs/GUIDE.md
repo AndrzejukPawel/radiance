@@ -710,29 +710,84 @@ blocks alone leaves the session re-running every linear layer over its whole tra
 every hit-rate counter reports as a hit. `/sessions` shows what is stored, where, and whether the
 linear half is being served.
 
-### 4.9 What a request that sets no sampler fields gets
+### 4.9 What a request that leaves a field out gets
 
-Resolution order, first one that exists wins:
+Every default below applies only to a request that does not name the field. A request that names
+it wins. Without any of these flags, the server behaves exactly as it always has.
+
+**Temperature, top-k, top-p, min-p.** First one that exists wins:
 
 1. `--temp` / `--top-k` / `--top-p` / `--min-p` on the command line
 2. `--generation-config PATH` — a `generation_config.json`
-3. the container's own `generation.*` metadata
-4. `<model>.generation.json` beside the container
+3. `<model>.generation.json` beside the container
+4. the container's own `generation.*` metadata
 5. the built-in defaults
 
 ```sh
 radiance --model m.rad --temp 0.7 --top-p 0.8 --top-k 20
 ```
 
+**The rest of the sampler** has a flag per field, spelled like the request field:
+`--presence-penalty`, `--frequency-penalty`, `--repetition-penalty`, `--repeat-last-n`,
+`--typical-p`, `--dry-multiplier`, `--dry-base`, `--dry-allowed-length`, `--dry-penalty-last-n`,
+`--dry-sequence-breakers` (a JSON array), `--xtc-probability`, `--xtc-threshold`. They are checked
+against the same ranges a request is, at startup:
+
+```sh
+radiance --model m.rad --presence-penalty 1.5 --repetition-penalty 1.05
+```
+
+**How much a request may generate.**
+
+- `--default-max-tokens N` sets `max_tokens` for a request that sends none. The default is 512.
+  `auto` means whatever the context leaves after the prompt.
+- `--max-tokens-cap N` is the most any request may generate. A larger `max_tokens` is cut to it
+  rather than refused, and the reply ends with `finish_reason: "length"`, the same as the context
+  bound (§5.8).
+
+```sh
+radiance --model m.rad --default-max-tokens auto --max-tokens-cap 32768
+```
+
+**Chat template variables.** `--chat-template-kwargs` hands variables to the chat template on
+every chat request, the way a request's own `chat_template_kwargs` does:
+
+```sh
+radiance --model m.rad --chat-template-kwargs '{"enable_thinking": false}'
+radiance --model m.rad --chat-template-kwargs @template-vars.json
+```
+
+- It takes a JSON object, or `@FILE` to read one. Give it more than once and a later key replaces
+  an earlier one.
+- A key the request's own `chat_template_kwargs` names is the request's.
+- Thinking is one setting with three spellings. A request that says anything about thinking
+  (`enable_thinking`, at the top level or in `chat_template_kwargs`, or `reasoning_effort`)
+  replaces the server's `enable_thinking`. One that names a `reasoning_effort` replaces the
+  server's effort too.
+- `messages`, `tools`, `bos_token`, `eos_token` and `add_generation_prompt` are refused: the
+  server sets those itself.
+- At startup a one-message chat is rendered with the variables. A value the template refuses
+  stops startup with the template's own message, instead of failing every request.
+- `/tokenize` renders `messages` with the same variables, so the count it gives is the prompt
+  chat serves.
+
 **`--reasoning-effort` is worth knowing about.** It is the default for chat requests that do not
 set one, and the value goes to the model's chat template verbatim — so the legal set is the
 template's. Qwen3.8 takes `xhigh|medium|low` and **defaults to `xhigh`**, which on a short task can
 spend the entire token budget inside `<think>` and return a turn with empty content and
-`finish_reason: "length"`. `"none"` turns thinking off.
+`finish_reason: "length"`. `"none"` turns thinking off. It cannot be combined with a
+`reasoning_effort` or `enable_thinking` key in `--chat-template-kwargs`. A value the template
+refuses is a warning at startup: requests that send their own effort still work.
 
 ```sh
 radiance --model m.rad --reasoning-effort medium
 ```
+
+**`--reasoning-format none`** leaves a reasoning block inline in `content` instead of returning it
+as `reasoning_content`, for a client that reads it there.
+
+`/server_info` lists every effective default under `request_defaults` (§6.2), and startup prints
+one line naming each one the command line moved.
 
 ### 4.10 Every flag
 
@@ -809,10 +864,48 @@ radiance --model m.rad --reasoning-effort medium
 | `--api-key KEY` | — | require `Authorization: Bearer KEY` on every request but `/health`, `/ping` and the dashboard page (§6.6) |
 | `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the one loaded serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card |
-| `--generation-config PATH` | — | sampler defaults from a `generation_config.json` |
 | `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the one the container carries. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
+| `--max-queued-requests N` | 8 × `--max-num-seqs` | requests admitted and unfinished at once; past it, 429 |
+| `--http-threads N` | one per core, at least 4 | HTTP workers kept while idle |
+| `--read-timeout S` | 30 | seconds a client may go silent while sending a request |
+| `--write-timeout S` | 600 | seconds one write to a client may block |
+| `--keep-alive-timeout S` | 5 | seconds an idle connection is held open between requests |
+| `--max-body-mib N` | 512 | the largest request body; images and video arrive base64 inside it |
+| `--retry-after S` | 1 | the `Retry-After` a 429 carries |
+| `--no-cors` | CORS on | send no CORS headers (§6.6) |
+
+**Request defaults and bounds** — what a request that leaves a field out gets (§4.9). A request
+that names the field wins.
+
+| flag | default | |
+|---|---|---|
+| `--generation-config PATH` | — | sampler defaults from a `generation_config.json` |
 | `--temp F`, `--top-k N`, `--top-p F`, `--min-p F` | from container | sampler defaults |
+| `--presence-penalty F`, `--frequency-penalty F` | 0 | [-2, 2] |
+| `--repetition-penalty F`, `--repeat-last-n N` | 1, 64 | > 0; ≥ -1 (-1 is all) |
+| `--typical-p F` | 1 | (0, 1] |
+| `--dry-multiplier F`, `--dry-base F`, `--dry-allowed-length N`, `--dry-penalty-last-n N` | 0, 1.75, 2, -1 | DRY; a multiplier of 0 is off |
+| `--dry-sequence-breakers JSON` | `["\n", ":", "\"", "*"]` | a JSON array of at most 16 strings |
+| `--xtc-probability F`, `--xtc-threshold F` | 0, 0.1 | [0, 1] |
+| `--default-max-tokens N` | 512 | `max_tokens` for a request that sends none; `auto` is what the context leaves |
+| `--max-tokens-cap N` | none | the most any request may generate; a larger `max_tokens` is cut to it, not refused |
+| `--max-n N` | the larger of 8 and `--max-num-seqs` | the largest `n` a request may ask for |
+| `--max-stop-strings N`, `--max-stop-bytes N` | 64, 4096 | how many stop strings a request may send, and how long each may be |
+| `--chat-template-kwargs JSON` | — | variables for the chat template on every chat request; a JSON object or `@FILE`, repeatable |
 | `--reasoning-effort S` | template's own | default `reasoning_effort` for chat |
+| `--reasoning-format MODE` | auto | `auto` returns reasoning as `reasoning_content`; `none` leaves it inline in `content` |
+
+**Media** — each replaces what the container's preprocessor configuration states. They do nothing
+for a model that takes no images or video.
+
+| flag | default | |
+|---|---|---|
+| `--image-min-pixels N`, `--image-max-pixels N` | container's | the band an image is resized into; one encoder pass (`--mm-max-patches`) still bounds the top |
+| `--video-min-pixels N`, `--video-max-pixels N` | container's | the same for a video's sampled frames together |
+| `--video-fps F` | container's, else 2 | frames sampled per second of video |
+| `--video-min-frames N`, `--video-max-frames N` | container's, else 4 and 768 | the fewest and most frames sampled from a video |
+| `--video-max-frame-tokens N` | container's, else 768 | the most prompt tokens one frame may become; 0 is no cap |
+| `--max-source-pixels N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
 **Quality measurement** — instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
 
@@ -999,7 +1092,7 @@ curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
 |---|---|
 | `model` | accepted and not enforced — one server serves one model |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
-| `max_tokens`, `max_completion_tokens` | default 512. Clamped to what the context leaves rather than refused — see §5.8 |
+| `max_tokens`, `max_completion_tokens` | default 512 (`--default-max-tokens`). Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused — see §5.8 |
 | `temperature` | [0, 2] |
 | `top_p` | (0, 1] |
 | `top_k` | ≥ 0, 0 disables |
@@ -1009,15 +1102,16 @@ curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
 | `xtc_probability`, `xtc_threshold` | |
 | `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | |
 | `seed` | absent means "pick one" — **not** seed 0 |
-| `n` | 1 to the larger of 8 and `--max-num-seqs`. Fan-out over the same prompt; the prefix cache makes it nearly free after the first |
+| `n` | 1 to `--max-n`, by default the larger of 8 and `--max-num-seqs`. Fan-out over the same prompt; the prefix cache makes it nearly free after the first |
 | `priority` | |
-| `stop` | a string or an array |
+| `stop` | a string or an array; at most 64 strings of 4096 bytes (`--max-stop-strings`, `--max-stop-bytes`) |
 | `ignore_eos` | generate to `max_tokens` whatever the model emits |
 | `stream`, `stream_options.include_usage` | |
 | `logprobs`, `top_logprobs` | **not implemented** — refused, not returned as nulls. `/server_info` reports `logprobs: false` |
 | `tools`, `tool_choice`, `parallel_tool_calls` | chat only |
 | `add_generation_prompt`, `chat_template_kwargs` | chat only |
 | `reasoning_effort`, `enable_thinking` | chat only |
+| `preserve_thinking` | chat only. The chat template variable of that name, as llama.cpp maps it; Qwen3.6 and later keep earlier turns' reasoning in the prompt with it |
 | `response_format` | chat only. Mutually exclusive with `grammar` |
 | `grammar` | a GBNF grammar directly. On chat it passes through the chat template and a template that drops it makes the request a refusal — see §5.5 |
 | `echo` | `/v1/completions` only |
@@ -1138,6 +1232,11 @@ model, on how many cards, with how much KV, drafting how deeply, over which wire
 the startup log too — but a startup log is on a machine, in a file, from a process that may have
 been restarted since.
 
+Its `request_defaults` object says what a request that leaves a field out is served with: every
+sampler field, `max_tokens`, `reasoning_effort`, `chat_template_kwargs` and `reasoning_format`,
+under the request's own spelling of each. `server.default_max_tokens` is `null` for `auto`, and
+`server.max_tokens_cap` is `null` when there is none.
+
 ### 6.3 Metrics
 
 `GET /metrics` is Prometheus text. Two families:
@@ -1200,7 +1299,8 @@ radiance --model m.rad -vv                    # same as trace
 
 ### 6.6 Security
 
-**There is no TLS, and without `--api-key` there is no authentication.** CORS is on.
+**There is no TLS, and without `--api-key` there is no authentication.** CORS is on, so a page on
+any origin can call the API from a browser; `--no-cors` turns it off.
 
 ```sh
 radiance --model m.rad --api-key "$KEY"

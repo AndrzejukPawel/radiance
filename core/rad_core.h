@@ -9,7 +9,9 @@
 #include "rad_internal.h"
 
 #include <atomic>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -673,6 +675,66 @@ struct Config {
     int     sample_top_k = -1;
     float   sample_top_p = -1.0f;
     float   sample_min_p = -1.0f;
+    /* THE REST OF THE SAMPLER, each one the default for a request that does not name the field.
+     * Optional rather than negative-for-unset: a presence penalty of -1 and a DRY multiplier of
+     * -1 are settings a request can send, so no value of the field itself can mean "not set".
+     * Unset, a request that sends nothing gets SamplingParams' own value, exactly as before the
+     * flags existed. */
+    std::optional<float> sample_typical_p, sample_rep_penalty, sample_pres_penalty,
+                         sample_freq_penalty, sample_dry_multiplier, sample_dry_base,
+                         sample_xtc_probability, sample_xtc_threshold;
+    std::optional<int>   sample_penalty_last_n, sample_dry_allowed_length,
+                         sample_dry_penalty_last_n;
+    std::optional<std::vector<std::string>> sample_dry_seq_breakers;
+
+    /* --default-max-tokens: what a request that names no max_tokens may generate. -1 is unset
+     * (the server's 512), 0 is `auto` (whatever the context leaves after the prompt). */
+    int64_t default_max_tokens = -1;
+    /* --max-tokens-cap: the most any request may generate. A larger max_tokens is clamped to it,
+     * the way the context clamps one, and the reply ends with finish_reason "length". 0 is none. */
+    int64_t max_tokens_cap = 0;
+    /* --max-n: the largest `n` a request may ask for. 0 is the larger of 8 and --max-num-seqs. */
+    int64_t max_n = 0;
+    /* --max-queued-requests: requests admitted and unfinished at once, beyond which the answer is
+     * 429. 0 is 8 x --max-num-seqs. */
+    int64_t max_queued_requests = 0;
+    /* --max-stop-strings / --max-stop-bytes: how many stop strings a request may send, and how
+     * long each may be. Every stop string is searched for in every stretch of generated text, so
+     * these bound what one request can make that scan cost. */
+    int64_t max_stop_strings = 64;
+    int64_t max_stop_bytes = 4096;
+
+    /* --chat-template-kwargs: variables handed to the chat template for every chat request, as
+     * key -> JSON text (a string arrives still quoted, as the template context wants it). A key
+     * the request's own chat_template_kwargs names is the request's. */
+    std::map<std::string, std::string> chat_template_kwargs;
+    /* --reasoning-format auto|none: `auto` returns a reasoning block as reasoning_content, `none`
+     * leaves it inline in content for a client that reads it there. */
+    std::string reasoning_format = "auto";
+
+    /* ---------------- THE HTTP TRANSPORT ----------------
+     * The values the transport has always used, settable. See TransportOptions (server/http.h). */
+    int     http_threads = 0;                /* 0: one per core, at least 4 */
+    int     http_read_timeout_s = 30;
+    int     http_write_timeout_s = 600;
+    int     http_keep_alive_timeout_s = 5;
+    int64_t http_max_body_mib = 512;
+    int     retry_after_s = 1;
+    bool    cors = true;
+
+    /* ---------------- MEDIA PREPROCESSING ----------------
+     * Each one replaces what the container's preprocessor configuration states (mm::VisionConfig).
+     * Unset, the container's value is served. */
+    std::optional<int64_t> image_min_pixels, image_max_pixels, video_min_pixels, video_max_pixels;
+    std::optional<double>  video_fps;
+    std::optional<int32_t> video_min_frames, video_max_frames, video_max_frame_tokens;
+    std::optional<int64_t> max_source_pixels;
+    bool media_flags_set() const {
+        return image_min_pixels || image_max_pixels || video_min_pixels || video_max_pixels ||
+               video_fps || video_min_frames || video_max_frames || video_max_frame_tokens ||
+               max_source_pixels;
+    }
+
     /* An operator-supplied generation_config.json, overriding the search described above. */
     std::string generation_config;
     /* --override-chat-template: a Jinja file whose text replaces the chat template the container

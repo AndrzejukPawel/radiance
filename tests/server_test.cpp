@@ -29,6 +29,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -89,9 +90,15 @@ struct FakeChatTemplate : IChatTemplate {
     mutable int last_n_tools = 0;
 
     int apply(const json& messages, const json& tools, const ChatRenderOptions& opt,
-              ChatRender* out, std::string*) const override {
+              ChatRender* out, std::string* why) const override {
         last_opt = opt;
         last_n_tools = (int)tools.size();
+        /* A template that raise_exception's on one variable, as Qwen3.8's does on an effort it
+         * does not know. */
+        if (!refuse_kwarg.empty() && opt.template_kwargs.count(refuse_kwarg)) {
+            if (why) *why = "the template does not take " + refuse_kwarg;
+            return RAD_E_UNSUPPORTED;
+        }
         std::string s;
         if (!tools.empty()) s += "[tools:" + std::to_string(tools.size()) + "]";
         if (!opt.enable_thinking) s += "[nothink]";
@@ -125,6 +132,7 @@ struct FakeChatTemplate : IChatTemplate {
 
     bool        with_parser = false;
     std::string refusal;
+    std::string refuse_kwarg;
 
     /* Reads "TOOL:<name>:<json...>" -- everything after the second colon is the arguments,
      * however incomplete, and it arrives a piece at a time. That is exactly the shape the
@@ -943,6 +951,349 @@ TEST(the_ways_of_turning_thinking_off_all_reach_the_template) {
     CHECK_EQ(f.post("/v1/chat/completions",
                     R"({"messages":[{"role":"user","content":"hi"}]})").status, 200);
     CHECK(f.tmpl.last_opt.enable_thinking);
+}
+
+/* ================================================================== deployment defaults
+ *
+ * Every default the command line can move, seen from a request: it reaches a request that leaves
+ * the field out, and loses to one that names it. */
+
+static OaiRequest chat_with(Fixture& f, const OaiLimits& lim, const std::string& extra) {
+    OaiRequest r;
+    ApiError e;
+    const std::string body =
+        R"({"messages":[{"role":"user","content":"hi"}])" + (extra.empty() ? "" : "," + extra) + "}";
+    CHECK_OK(parse_chat_request(body, f.odeps(), lim, &r, &e));
+    return r;
+}
+
+TEST(the_rest_of_the_sampler_is_seeded_from_the_deployment_too) {
+    Fixture f;
+    OaiLimits lim = f.limits();
+    lim.default_sampling.pres_penalty = 1.5f;
+    lim.default_sampling.rep_penalty = 1.05f;
+    lim.default_sampling.penalty_last_n = 256;
+    lim.default_sampling.typical_p = 0.9f;
+    lim.default_sampling.dry_multiplier = 0.8f;
+    lim.default_sampling.xtc_probability = 0.5f;
+
+    OaiRequest r = chat_with(f, lim, "");
+    CHECK_NEAR(r.sp.pres_penalty, 1.5f, 1e-6);
+    CHECK_NEAR(r.sp.rep_penalty, 1.05f, 1e-6);
+    CHECK_EQ(r.sp.penalty_last_n, 256);
+    CHECK_NEAR(r.sp.typical_p, 0.9f, 1e-6);
+    CHECK_NEAR(r.sp.dry_multiplier, 0.8f, 1e-6);
+    CHECK_NEAR(r.sp.xtc_probability, 0.5f, 1e-6);
+
+    OaiRequest r2 = chat_with(f, lim, R"("presence_penalty":0,"repeat_last_n":64)");
+    CHECK_NEAR(r2.sp.pres_penalty, 0.0f, 1e-6);
+    CHECK_EQ(r2.sp.penalty_last_n, 64);
+    CHECK_NEAR(r2.sp.rep_penalty, 1.05f, 1e-6);
+
+    /* A STATED EMPTY BREAKER LIST STAYS EMPTY, which SamplingParams alone cannot say: unstated is
+     * llama-server's four. A request's own list still wins. */
+    lim.default_sampling.dry_seq_breakers.clear();
+    lim.default_dry_breakers_set = true;
+    CHECK(chat_with(f, lim, "").sp.dry_seq_breakers.empty());
+    CHECK(chat_with(f, lim, R"("dry_sequence_breakers":["x"])").sp.dry_seq_breakers ==
+          std::vector<std::string>({ "x" }));
+    lim.default_sampling.dry_seq_breakers = { "\n" };
+    CHECK(chat_with(f, lim, "").sp.dry_seq_breakers == std::vector<std::string>({ "\n" }));
+}
+
+/* A sampler field's range is ONE table for the request and the flag; this holds the request half
+ * of it to the exact sentences it has always carried. */
+TEST(the_shared_sampler_ranges_refuse_in_the_words_a_request_always_got) {
+    struct Case { const char* body; const char* param; const char* msg; };
+    const Case cases[] = {
+        { R"("temperature":2.5)",        "temperature",        "must be in [0, 2], got 2.5" },
+        { R"("top_p":0)",                "top_p",              "must be in (0, 1]" },
+        { R"("top_k":-1)",               "top_k",              "must be >= 0 (0 disables it)" },
+        { R"("min_p":1.5)",              "min_p",              "must be in [0, 1], got 1.5" },
+        { R"("typical_p":0)",            "typical_p",          "must be in (0, 1]" },
+        { R"("presence_penalty":3)",     "presence_penalty",   "must be in [-2, 2], got 3" },
+        { R"("frequency_penalty":-3)",   "frequency_penalty",  "must be in [-2, 2], got -3" },
+        { R"("repetition_penalty":0)",   "repetition_penalty", "must be > 0" },
+        { R"("repeat_last_n":-2)",       "repeat_last_n",      "must be >= -1" },
+        { R"("xtc_probability":2)",      "xtc_probability",    "must be in [0, 1], got 2" },
+        { R"("xtc_threshold":-1)",       "xtc_threshold",      "must be in [0, 1], got -1" },
+        { R"("dry_base":0.5)",           "dry_base",           "must be >= 1" },
+        { R"("dry_penalty_last_n":-2)",  "dry_penalty_last_n", "must be >= -1" },
+    };
+    Fixture f;
+    for (const Case& c : cases) {
+        OaiRequest r;
+        ApiError e;
+        const std::string body =
+            std::string(R"({"messages":[{"role":"user","content":"hi"}],)") + c.body + "}";
+        CHECK_EQ(parse_chat_request(body, f.odeps(), f.limits(), &r, &e), RAD_E_INVAL);
+        CHECK_EQ(e.param, std::string(c.param));
+        CHECK_EQ(e.message, std::string(c.param) + ": " + c.msg);
+    }
+    /* The other half: the same function, as config.cpp calls it. */
+    std::string why;
+    CHECK(sampler_value_ok("presence_penalty", -2.0, &why));
+    CHECK(!sampler_value_ok("presence_penalty", std::nan(""), &why));
+    CHECK(!sampler_value_ok("temperature", std::nan(""), &why));
+    CHECK(sampler_value_ok("dry_multiplier", -5.0, &why));     /* unbounded, as a request is */
+}
+
+/* `--default-max-tokens auto` IS WHAT THE CONTEXT LEAVES, and `--max-tokens-cap` CLAMPS like the
+ * context does: a request asking for more is served up to the cap, not refused. */
+TEST(the_max_tokens_default_and_cap_bound_a_request_like_the_context) {
+    Fixture f;
+    OaiLimits lim = f.limits();
+    lim.max_ctx = 64;
+    lim.default_max_tokens = 0;
+
+    OaiRequest r = chat_with(f, lim, "");
+    CHECK_EQ((int64_t)r.prompts[0].tokens.size() + r.max_tokens, lim.max_ctx);
+    CHECK_EQ(chat_with(f, lim, R"("max_tokens":5)").max_tokens, 5);
+
+    lim.max_tokens_cap = 10;
+    CHECK_EQ(chat_with(f, lim, "").max_tokens, 10);                     /* auto, then the cap */
+    CHECK_EQ(chat_with(f, lim, R"("max_tokens":9999)").max_tokens, 10);
+    CHECK_EQ(chat_with(f, lim, R"("max_tokens":5)").max_tokens, 5);
+
+    /* The cap holds where no context is declared, and on /v1/completions. */
+    lim.max_ctx = 0;
+    lim.default_max_tokens = 512;
+    CHECK_EQ(chat_with(f, lim, "").max_tokens, 10);
+    OaiRequest c;
+    ApiError e;
+    CHECK_OK(parse_completion_request(R"({"prompt":"ab","max_tokens":100})", f.odeps(), lim, &c, &e));
+    CHECK_EQ(c.max_tokens, 10);
+
+    /* Unset, nothing moves: the fixture's default with no cap and no context. */
+    CHECK_EQ(chat_with(f, f.limits(), "").max_tokens, 32);
+    CHECK_EQ(chat_with(f, f.limits(), R"("max_tokens":100000)").max_tokens, 100000);
+}
+
+TEST(the_stop_bounds_are_the_deployments) {
+    Fixture f;
+    OaiLimits lim = f.limits();
+    lim.max_stops = 2;
+    lim.max_stop_bytes = 3;
+    OaiRequest r;
+    ApiError e;
+    CHECK_OK(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],"stop":["a","bcd"]})",
+                                f.odeps(), lim, &r, &e));
+    CHECK_EQ(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],"stop":["a","b","c"]})",
+                                f.odeps(), lim, &r, &e), RAD_E_INVAL);
+    CHECK(has(e.message, "at most 2 stop strings"));
+    CHECK_EQ(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],"stop":"abcd"})",
+                                f.odeps(), lim, &r, &e), RAD_E_INVAL);
+    CHECK(has(e.message, "at most 3 bytes"));
+}
+
+/* THE DEPLOYMENT'S TEMPLATE VARIABLES go under the request's, key by key. */
+TEST(the_deployments_template_variables_reach_the_template_under_the_requests) {
+    Fixture f;
+    OaiLimits lim = f.limits();
+    lim.default_template_kwargs = { { "custom", "\"a\"" }, { "depth", "2" } };
+
+    chat_with(f, lim, "");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("custom"), std::string("\"a\""));
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("depth"), std::string("2"));
+
+    chat_with(f, lim, R"("chat_template_kwargs":{"custom":"b"})");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("custom"), std::string("\"b\""));
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("depth"), std::string("2"));
+
+    lim.reasoning_format = "none";
+    chat_with(f, lim, "");
+    CHECK_EQ(f.tmpl.last_opt.reasoning_format, std::string("none"));
+    chat_with(f, f.limits(), "");
+    CHECK_EQ(f.tmpl.last_opt.reasoning_format, std::string("auto"));
+    CHECK(f.tmpl.last_opt.template_kwargs.empty());
+
+    /* /tokenize renders with the same variables, so the prompt it counts is the prompt chat
+     * serves -- and with none set it renders exactly as before. */
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    FakeChatTemplate tmpl;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    d.chat = &tmpl;
+    const std::string body = R"({"messages":[{"role":"user","content":"hi"}]})";
+    {
+        ServerOptions o;
+        o.default_template_kwargs = { { "enable_thinking", "false" }, { "custom", "\"a\"" } };
+        Server srv(d, o);
+        CHECK_EQ(srv.router().call("POST", "/tokenize", body).status, 200);
+        CHECK(!tmpl.last_opt.enable_thinking);
+        CHECK_EQ(tmpl.last_opt.template_kwargs.at("custom"), std::string("\"a\""));
+        CHECK_EQ(srv.router().call("POST", "/tokenize",
+                                   R"({"messages":[{"role":"user","content":"hi"}],
+                                       "chat_template_kwargs":{"enable_thinking":true}})").status, 200);
+        CHECK_EQ(tmpl.last_opt.template_kwargs.at("enable_thinking"), std::string("true"));
+    }
+    {
+        ServerOptions o;
+        Server srv(d, o);
+        CHECK_EQ(srv.router().call("POST", "/tokenize", body).status, 200);
+        CHECK(tmpl.last_opt.enable_thinking);
+        CHECK(tmpl.last_opt.template_kwargs.empty());
+    }
+}
+
+/* THINKING IS ONE SETTING WITH THREE SPELLINGS, and a deployment default in one spelling must not
+ * outlive a request that used another. */
+TEST(a_request_that_says_anything_about_thinking_replaces_the_deployments_default) {
+    Fixture f;
+    OaiLimits off = f.limits();
+    off.default_template_kwargs = { { "enable_thinking", "false" } };
+
+    chat_with(f, off, "");
+    CHECK(!f.tmpl.last_opt.enable_thinking);
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("enable_thinking"), std::string("false"));
+
+    for (const char* extra : { R"("enable_thinking":true)",
+                               R"("chat_template_kwargs":{"enable_thinking":true})",
+                               R"("reasoning_effort":"high")",
+                               R"("chat_template_kwargs":{"reasoning_effort":"high"})" }) {
+        chat_with(f, off, extra);
+        CHECK(f.tmpl.last_opt.enable_thinking);
+    }
+    chat_with(f, off, R"("reasoning_effort":"high")");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"high\""));
+    CHECK(!f.tmpl.last_opt.template_kwargs.count("enable_thinking"));
+    /* An empty effort is no effort, and leaves the default standing. */
+    chat_with(f, off, R"("reasoning_effort":"")");
+    CHECK(!f.tmpl.last_opt.enable_thinking);
+
+    /* --reasoning-effort none is the same default in its other spelling. */
+    OaiLimits none = f.limits();
+    none.default_reasoning_effort = "none";
+    chat_with(f, none, "");
+    CHECK(!f.tmpl.last_opt.enable_thinking);
+    chat_with(f, none, R"("enable_thinking":true)");
+    CHECK(f.tmpl.last_opt.enable_thinking);
+    chat_with(f, none, R"("reasoning_effort":"low")");
+    CHECK(f.tmpl.last_opt.enable_thinking);
+
+    /* A LEVEL is an effort default: a request that only turns thinking on keeps it, as before,
+     * and one that names its own effort replaces it. */
+    OaiLimits low = f.limits();
+    low.default_reasoning_effort = "low";
+    chat_with(f, low, R"("enable_thinking":true)");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"low\""));
+    chat_with(f, low, R"("reasoning_effort":"xhigh")");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"xhigh\""));
+    chat_with(f, low, R"("chat_template_kwargs":{"reasoning_effort":"xhigh"})");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"xhigh\""));
+
+    OaiLimits kw_low = f.limits();
+    kw_low.default_template_kwargs = { { "reasoning_effort", "\"low\"" } };
+    chat_with(f, kw_low, R"("enable_thinking":true)");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"low\""));
+    chat_with(f, kw_low, R"("reasoning_effort":"xhigh")");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("reasoning_effort"), std::string("\"xhigh\""));
+}
+
+/* A TEMPLATE DEFAULT THE TEMPLATE REFUSES is found at startup, and attributed to the flag that
+ * set it. A render that fails without any default blames nothing. */
+TEST(a_template_default_the_template_refuses_is_found_before_a_caller_sends_one) {
+    auto run = [](const std::map<std::string, std::string>& kw, const std::string& effort,
+                  const std::string& refuse, std::string* kw_why, std::string* eff_why) {
+        FakeScheduler sched;
+        FakeTokenizer tok;
+        FakeChatTemplate tmpl;
+        tmpl.refuse_kwarg = refuse;
+        Deps d;
+        d.sched = &sched;
+        d.tok = &tok;
+        d.chat = &tmpl;
+        ServerOptions o;
+        o.default_template_kwargs = kw;
+        o.default_reasoning_effort = effort;
+        Server srv(d, o);
+        srv.check_template_defaults(kw_why, eff_why);
+    };
+    std::string kw_why, eff_why;
+    run({ { "bad", "1" } }, "", "bad", &kw_why, &eff_why);
+    CHECK(has(kw_why, "does not take bad"));
+    CHECK(eff_why.empty());
+
+    run({ { "fine", "1" } }, "high", "reasoning_effort", &kw_why, &eff_why);
+    CHECK(kw_why.empty());
+    CHECK(has(eff_why, "does not take reasoning_effort"));
+
+    run({ { "fine", "1" } }, "high", "", &kw_why, &eff_why);
+    CHECK(kw_why.empty() && eff_why.empty());
+    /* "none" is enable_thinking false, never a template variable, so nothing to refuse. */
+    run({}, "none", "reasoning_effort", &kw_why, &eff_why);
+    CHECK(kw_why.empty() && eff_why.empty());
+}
+
+TEST(server_info_reports_what_a_request_that_leaves_a_field_out_gets) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    FakeChatTemplate tmpl;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    d.chat = &tmpl;
+    {
+        ServerOptions o;
+        Server srv(d, o);
+        const json j = json::parse(srv.router().call("GET", "/server_info").body);
+        CHECK_EQ(j["server"]["default_max_tokens"].get<int64_t>(), 512);
+        CHECK(j["server"]["max_tokens_cap"].is_null());
+        CHECK_EQ(j["server"]["max_stop_strings"].get<int64_t>(), 64);
+        const json& r = j["request_defaults"];
+        CHECK_NEAR(r["temperature"].get<double>(), 1.0, 1e-9);
+        CHECK_NEAR(r["repetition_penalty"].get<double>(), 1.0, 1e-9);
+        CHECK_EQ(r["dry_sequence_breakers"].size(), 4u);
+        CHECK(r["reasoning_effort"].is_null());
+        CHECK(r["chat_template_kwargs"].is_object() && r["chat_template_kwargs"].empty());
+        CHECK_EQ(r["reasoning_format"].get<std::string>(), std::string("auto"));
+    }
+    {
+        ServerOptions o;
+        o.default_max_tokens = 0;
+        o.max_tokens_cap = 4096;
+        o.default_sampling.pres_penalty = 1.5f;
+        o.default_template_kwargs = { { "enable_thinking", "false" }, { "tag", "\"x\"" } };
+        Server srv(d, o);
+        const json j = json::parse(srv.router().call("GET", "/server_info").body);
+        CHECK(j["server"]["default_max_tokens"].is_null());          /* auto */
+        CHECK_EQ(j["server"]["max_tokens_cap"].get<int64_t>(), 4096);
+        const json& r = j["request_defaults"];
+        CHECK_NEAR(r["presence_penalty"].get<double>(), 1.5, 1e-6);
+        CHECK_EQ(r["chat_template_kwargs"]["enable_thinking"].get<bool>(), false);
+        CHECK_EQ(r["chat_template_kwargs"]["tag"].get<std::string>(), std::string("x"));
+    }
+}
+
+/* `preserve_thinking` AT THE TOP LEVEL IS THE TEMPLATE VARIABLE, as `enable_thinking` is. oh-my-pi
+ * sends it there and in chat_template_kwargs on every request to a Qwen model, and refusing it as
+ * an unknown field failed all of them. */
+TEST(preserve_thinking_at_the_top_level_reaches_the_template) {
+    Fixture f;
+    OaiLimits lim = f.limits();
+    chat_with(f, lim, R"("preserve_thinking":true)");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("preserve_thinking"), std::string("true"));
+    CHECK(f.tmpl.last_opt.enable_thinking);                /* a history knob, not a thinking one */
+
+    /* oh-my-pi's exact pair, and the top-level spelling winning a disagreement. */
+    chat_with(f, lim, R"("preserve_thinking":true,"chat_template_kwargs":{"preserve_thinking":true})");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("preserve_thinking"), std::string("true"));
+    chat_with(f, lim, R"("preserve_thinking":false,"chat_template_kwargs":{"preserve_thinking":true})");
+    CHECK_EQ(f.tmpl.last_opt.template_kwargs.at("preserve_thinking"), std::string("false"));
+
+    chat_with(f, lim, "");
+    CHECK(!f.tmpl.last_opt.template_kwargs.count("preserve_thinking"));
+
+    OaiRequest r;
+    ApiError e;
+    CHECK_EQ(parse_chat_request(R"({"messages":[{"role":"user","content":"hi"}],"preserve_thinking":"yes"})",
+                                f.odeps(), lim, &r, &e), RAD_E_INVAL);
+    CHECK_EQ(e.param, std::string("preserve_thinking"));
+    /* A chat field, not a completion one: /v1/completions has no template to hand it to. */
+    CHECK_EQ(parse_completion_request(R"({"prompt":"ab","preserve_thinking":true})", f.odeps(), lim,
+                                      &r, &e), RAD_E_INVAL);
 }
 
 /* parallel_tool_calls reaches the template, because it is the one tool-choice knob the generated
@@ -1852,7 +2203,8 @@ struct LiveServer {
     std::vector<int>        fds;
 
     /* Generations never finish on their own; each one holds its worker until its peer leaves. */
-    LiveServer(int n_threads, int64_t max_seqs) {
+    LiveServer(int n_threads, int64_t max_seqs,
+               const std::function<void(ServerOptions&)>& tweak = nullptr) {
         sched.reply = "abcdefgh";
         sched.hang = true;
         Deps d;
@@ -1864,6 +2216,7 @@ struct LiveServer {
         o.n_threads = n_threads;
         o.max_seqs = max_seqs;
         o.default_max_tokens = 32;
+        if (tweak) tweak(o);
         srv.reset(new Server(d, o));
         serving = std::thread([this] { srv->run(); });
         for (int i = 0; i < 500 && srv->port() == 0; ++i)
@@ -1910,6 +2263,88 @@ TEST(a_probe_and_a_429_are_answered_while_every_admitted_request_holds_a_worker)
     const int probe = s.open("GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
     REQUIRE(probe >= 0);
     CHECK(has(status_line(probe), " 200 "));
+}
+
+/* The response head on `fd`: everything up to the blank line, or what arrived before the read
+ * timeout. */
+static std::string response_head(int fd) {
+    std::string got;
+    char buf[512];
+    while (got.find("\r\n\r\n") == std::string::npos) {
+        const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+        if (n <= 0) break;
+        got.append(buf, (size_t)n);
+    }
+    return got.substr(0, got.find("\r\n\r\n"));
+}
+
+/* THE TRANSPORT SETTINGS REACH THE LISTENER. CORS headers are on unless turned off, and a body
+ * past --max-body-mib is refused before it is read. */
+TEST(the_transport_settings_reach_the_listener) {
+    const std::string probe = "GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    {
+        LiveServer s(4, 1);
+        REQUIRE(s.srv->port() > 0);
+        const int fd = s.open(probe);
+        REQUIRE(fd >= 0);
+        CHECK(has(response_head(fd), "Access-Control-Allow-Origin: *"));
+    }
+    {
+        LiveServer s(4, 1, [](ServerOptions& o) {
+            o.cors = false;
+            o.max_body_bytes = 64;
+        });
+        REQUIRE(s.srv->port() > 0);
+        const int fd = s.open(probe);
+        REQUIRE(fd >= 0);
+        const std::string head = response_head(fd);
+        CHECK(has(head, " 200 "));
+        CHECK(!has(head, "Access-Control-Allow-Origin"));
+
+        const std::string big = std::string(R"({"prompt":")") + std::string(100, 'x') + "\"}";
+        const int b = s.open("POST /v1/completions HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
+                             "Content-Type: application/json\r\nContent-Length: " +
+                             std::to_string(big.size()) + "\r\n\r\n" + big);
+        REQUIRE(b >= 0);
+        CHECK(has(status_line(b), " 413 "));
+    }
+}
+
+/* The Retry-After a 429 carries is the deployment's. */
+TEST(a_429_carries_the_deployments_retry_after) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    sched.reply = "abcdefgh";
+    sched.hang = true;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    ServerOptions o;
+    o.max_seqs = 1;
+    o.queue_depth = 1;
+    o.retry_after_s = 7;
+    o.default_max_tokens = 32;
+    auto srv = std::make_unique<Server>(d, o);
+    std::atomic<bool> never{false};
+    std::vector<HttpResponse> live;
+    std::string retry;
+    for (int i = 0; i < 2; ++i) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/completions";
+        q.body = R"({"prompt":"hi","stream":true})";
+        q.closed = [&never] { return never.load(); };
+        HttpResponse r = srv->router().dispatch(q);
+        if (r.status == 429) {
+            for (auto& h : r.headers) if (h.first == "Retry-After") retry = h.second;
+        } else {
+            live.push_back(std::move(r));
+        }
+    }
+    CHECK_EQ(retry, std::string("7"));
+    for (auto& r : live) if (r.on_close) r.on_close(false);
+    sched.join_all();
+    srv.reset();
 }
 
 RAD_TEST_MAIN()

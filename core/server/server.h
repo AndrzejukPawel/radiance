@@ -66,8 +66,11 @@ struct ServerOptions {
     int         retry_after_s = 1;
 
     int64_t     max_ctx = 0;
-    int64_t     default_max_tokens = 512;
+    int64_t     default_max_tokens = 512;   /* 0: what the context leaves (OaiLimits) */
+    int64_t     max_tokens_cap = 0;         /* 0: none */
     int         max_n = 8;
+    int64_t     max_stops = 64;
+    int64_t     max_stop_bytes = 4096;
 
     bool        supports_logprobs = false;
     /* The deployment default for `reasoning_effort`, empty for the template's own. See
@@ -76,6 +79,10 @@ struct ServerOptions {
     /* What a request that sends no sampler fields is served with. See
      * OaiLimits::default_sampling; only the sampler knobs are read from it. */
     SamplingParams default_sampling;
+    bool        default_dry_breakers_set = false;
+    /* The deployment's chat template variables and reply format. See OaiLimits. */
+    std::map<std::string, std::string> default_template_kwargs;
+    std::string reasoning_format = "auto";
     bool        allow_image = false;
     bool        allow_video = false;
     bool        allow_audio = false;
@@ -104,6 +111,12 @@ struct ServerOptions {
 
     std::string api_key;
     bool        cors = true;
+
+    /* The transport's timeouts and body bound. See TransportOptions. */
+    int         read_timeout_s = 30;
+    int         write_timeout_s = 600;
+    int         keep_alive_timeout_s = 5;
+    size_t      max_body_bytes = 512ull << 20;
 };
 
 class Server {
@@ -120,6 +133,14 @@ public:
     const Router& router() const { return router_; }
 
     int  run();            /* binds, serves, blocks. RAD_OK or negative. */
+
+    /* THE DEPLOYMENT'S TEMPLATE DEFAULTS, RENDERED ONCE BEFORE A CALLER DEPENDS ON THEM. A value
+     * the chat template refuses is a 400 on every request that leaves it to the default, so a
+     * one-message chat is parsed exactly as a request would be: first with no template defaults,
+     * then with the --chat-template-kwargs ones, then with the --reasoning-effort one as well.
+     * A render that fails at the first step says nothing about the defaults and is not reported.
+     * `kwargs_why` / `effort_why` are left empty, or hold the template's refusal at that step. */
+    void check_template_defaults(std::string* kwargs_why, std::string* effort_why) const;
     void stop();
     int  port() const { return transport_.port(); }   /* 0 until run() is accepting */
 

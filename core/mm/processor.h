@@ -62,6 +62,11 @@ struct VisionConfig {
     /* A whole video's patch budget, across all its passes. */
     int64_t max_video_patches = 0;
 
+    /* The pixel bands are non-empty and the frame counts and rate positive. RAD_OK, or
+     * RAD_E_INVAL with the first one that is not in `why`. from_meta runs it on what the
+     * container states, and the engine again after the command line has replaced some of it. */
+    int check(std::string* why) const;
+
     int64_t patch_dim() const { return 3LL * temporal * patch * patch; }
     int32_t factor() const { return patch * merge; }
 

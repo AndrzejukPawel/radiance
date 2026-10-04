@@ -155,6 +155,7 @@ HttpResponse Server::handle_tokenize(const HttpRequest& req) {
 
         ChatRenderOptions opt;
         opt.add_generation_prompt = get_bool_or(b, "add_generation_prompt", true);
+        apply_template_defaults(b, lim_, &opt);
         auto kw = b.find("chat_template_kwargs");
         if (kw != b.end() && kw->is_object())
             for (auto it = kw->begin(); it != kw->end(); ++it)
@@ -273,8 +274,13 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     srv["max_model_len"]      = opt_.max_ctx;
     srv["max_num_seqs"]       = opt_.max_seqs;
     srv["queue_cap"]          = queue_depth_;
-    srv["default_max_tokens"] = opt_.default_max_tokens;
+    /* null is `--default-max-tokens auto`: what the context leaves after the prompt. */
+    srv["default_max_tokens"] = opt_.default_max_tokens > 0 ? json(opt_.default_max_tokens)
+                                                            : json(nullptr);
+    srv["max_tokens_cap"]     = opt_.max_tokens_cap > 0 ? json(opt_.max_tokens_cap) : json(nullptr);
     srv["max_n"]              = opt_.max_n;
+    srv["max_stop_strings"]   = opt_.max_stops;
+    srv["max_stop_bytes"]     = opt_.max_stop_bytes;
     srv["uptime_s"]           = unix_now() - started_at_;
     srv["in_flight"]          = in_flight_.load(std::memory_order_relaxed);
 
@@ -289,9 +295,43 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
     caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
     caps["logprobs"]  = opt_.supports_logprobs;
 
+    /* WHAT A REQUEST THAT LEAVES A FIELD OUT GETS, under the request's own spelling of each
+     * field, so a client can read off exactly what leaving one out means on this deployment. */
+    const SamplingParams& sp = opt_.default_sampling;
+    json defs;
+    defs["temperature"]        = sp.temp;
+    defs["top_k"]              = sp.top_k;
+    defs["top_p"]              = sp.top_p;
+    defs["min_p"]              = sp.min_p;
+    defs["typical_p"]          = sp.typical_p;
+    defs["presence_penalty"]   = sp.pres_penalty;
+    defs["frequency_penalty"]  = sp.freq_penalty;
+    defs["repetition_penalty"] = sp.rep_penalty;
+    defs["repeat_last_n"]      = sp.penalty_last_n;
+    defs["dry_multiplier"]     = sp.dry_multiplier;
+    defs["dry_base"]           = sp.dry_base;
+    defs["dry_allowed_length"] = sp.dry_allowed_length;
+    defs["dry_penalty_last_n"] = sp.dry_penalty_last_n;
+    defs["dry_sequence_breakers"] = opt_.default_dry_breakers_set
+                                        ? json(sp.dry_seq_breakers)
+                                        : json(std::vector<std::string>{ "\n", ":", "\"", "*" });
+    defs["xtc_probability"]    = sp.xtc_probability;
+    defs["xtc_threshold"]      = sp.xtc_threshold;
+    defs["max_tokens"]         = srv["default_max_tokens"];
+    defs["reasoning_effort"]   = opt_.default_reasoning_effort.empty()
+                                     ? json(nullptr) : json(opt_.default_reasoning_effort);
+    json kw = json::object();
+    for (const auto& [k, v] : opt_.default_template_kwargs) {
+        json parsed = json::parse(v, nullptr, false);
+        kw[k] = parsed.is_discarded() ? json(v) : std::move(parsed);
+    }
+    defs["chat_template_kwargs"] = std::move(kw);
+    defs["reasoning_format"]     = opt_.reasoning_format;
+
     json o;
-    o["server"]       = std::move(srv);
-    o["capabilities"] = std::move(caps);
+    o["server"]           = std::move(srv);
+    o["request_defaults"] = std::move(defs);
+    o["capabilities"]     = std::move(caps);
     o["endpoints"]    = router_.routes();
 
     /* Spliced rather than re-parsed field by field: the engine owns what it says about itself and

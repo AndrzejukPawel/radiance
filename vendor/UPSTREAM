@@ -99,6 +99,7 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0011-chat-add_bos-must-come-from-the-inputs.patch
                    patches/0012-json-schema-a-schema-no-value-satisfies.patch
                    patches/0013-json-schema-a-count-past-int-is-no-bound.patch
+                   patches/0014-json-schema-a-not-of-every-type-is-never.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -444,3 +445,18 @@ PATCH SERIES
       long. A count that is negative or not a number is refused by name. A float count is
       truncated, where maxItems used to ignore one. The other half of the same report -- any count
       past 2000 refused -- was the GBNF parser's, and is fixed in core/sample/gbnf.cpp.
+
+  patches/0014-json-schema-a-not-of-every-type-is-never.patch
+
+      0012 recognised `never` only as `{"not": {}}`. oh-my-pi 18.6.0 sends its `task` tool's
+      optional `model` as the `not` of a union of all six JSON types -- `{"not": {"anyOf":
+      [{"type": "string"}, {"type": "number"}, {"type": "boolean"}, {"type": "object"},
+      {"type": "array"}, {"type": "null"}]}}` -- so under every template that constrains tool
+      arguments the request still failed with "Unsupported schema keyword \"not\"". A `not` is now
+      `never` whenever what it negates accepts every value: `{}` or `true`, a type list naming all
+      six types, or a union of bare types that between them name all six (an alternative that is
+      itself universal settles it). Annotations may sit beside; any other keyword narrows the
+      schema, an alternative that constrains more than its type is not counted, and `integer` does
+      not stand for `number`, so a `not` is only read as `never` when it is. Every other `not` is
+      refused as 0004 refuses it. The comment of 0012 above is_unsatisfiable, which 0013 had left
+      above _schema_count, is back beside the function it describes.

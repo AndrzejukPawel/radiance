@@ -6,9 +6,19 @@
  * (spec §6).
  */
 #include "rad_core.h"
+#include "sample/host_ref.h"
+#include "server/oai.h"
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 
 namespace rad {
 
@@ -104,6 +114,58 @@ static const Flag g_flags[] = {
     "                                    set is the template's: Qwen3.8 takes xhigh|medium|low and defaults\n"
     "                                    to xhigh, which on a short task can spend the whole token budget\n"
     "                                    inside <think> and answer nothing. \"none\" turns thinking off" },
+    { "--typical-p",          "F",      "default typical_p, (0, 1]. This flag and the eleven below set the default\n"
+    "                                    for requests that do not name the field; a request that names it wins" },
+    { "--presence-penalty",   "F",      "default presence_penalty, [-2, 2]" },
+    { "--frequency-penalty",  "F",      "default frequency_penalty, [-2, 2]" },
+    { "--repetition-penalty", "F",      "default repetition_penalty, > 0" },
+    { "--repeat-last-n",      "N",      "default repeat_last_n, the tokens those penalties look back over; -1 is all" },
+    { "--dry-multiplier",     "F",      "default dry_multiplier; 0 is DRY off" },
+    { "--dry-base",           "F",      "default dry_base, >= 1" },
+    { "--dry-allowed-length", "N",      "default dry_allowed_length" },
+    { "--dry-penalty-last-n", "N",      "default dry_penalty_last_n; -1 is the whole context" },
+    { "--dry-sequence-breakers", "JSON", "default dry_sequence_breakers, a JSON array of at most 16 strings" },
+    { "--xtc-probability",    "F",      "default xtc_probability, [0, 1]" },
+    { "--xtc-threshold",      "F",      "default xtc_threshold, [0, 1]" },
+    { "--default-max-tokens", "N",      "max_tokens for requests that do not set one (default 512). `auto` is\n"
+    "                                    whatever the context leaves after the prompt" },
+    { "--max-tokens-cap",     "N",      "the most any request may generate. A larger max_tokens is cut to it rather\n"
+    "                                    than refused, and the reply ends with finish_reason \"length\". 0 is none\n"
+    "                                    (default)" },
+    { "--max-n",              "N",      "the largest `n` a request may ask for (default: the larger of 8 and\n"
+    "                                    --max-num-seqs)" },
+    { "--max-queued-requests", "N",     "requests admitted and unfinished at once, past which the answer is 429\n"
+    "                                    (default 8 x --max-num-seqs)" },
+    { "--max-stop-strings",   "N",      "stop strings one request may send (default 64)" },
+    { "--max-stop-bytes",     "N",      "bytes in one stop string (default 4096)" },
+    { "--chat-template-kwargs", "JSON", "variables handed to the chat template on every chat request: a JSON object,\n"
+    "                                    or @FILE to read one. Repeatable, a later key replacing an earlier one.\n"
+    "                                    A key the request's own chat_template_kwargs names is the request's, and a\n"
+    "                                    request that says anything about thinking replaces enable_thinking and\n"
+    "                                    reasoning_effort here" },
+    { "--reasoning-format",   "MODE",   "auto (default): a reasoning block comes back as reasoning_content.\n"
+    "                                    none: it stays inline in content" },
+
+    { "--http-threads",       "N",      "HTTP workers kept while idle (default: one per core, at least 4)" },
+    { "--read-timeout",       "S",      "seconds a client may go silent while sending a request (default 30)" },
+    { "--write-timeout",      "S",      "seconds one write to a client may block (default 600)" },
+    { "--keep-alive-timeout", "S",      "seconds an idle connection is held open between requests (default 5)" },
+    { "--max-body-mib",       "N",      "the largest request body; images and video arrive base64 inside it\n"
+    "                                    (default 512)" },
+    { "--retry-after",        "S",      "the Retry-After a 429 carries, in seconds (default 1)" },
+    { "--no-cors",            nullptr,  "send no CORS headers, so a page on another origin cannot read the API" },
+
+    { "--image-min-pixels",   "N",      "an image is resized to at least N pixels (default: the container's)" },
+    { "--image-max-pixels",   "N",      "and to at most N; one encoder pass (--mm-max-patches) still bounds it" },
+    { "--video-min-pixels",   "N",      "a video's sampled frames together resize to at least N pixels" },
+    { "--video-max-pixels",   "N",      "and to at most N" },
+    { "--video-fps",          "F",      "frames sampled per second of video" },
+    { "--video-min-frames",   "N",      "the fewest frames sampled from a video" },
+    { "--video-max-frames",   "N",      "the most frames sampled from a video" },
+    { "--video-max-frame-tokens", "N",  "the most prompt tokens one video frame may become; 0 is no cap" },
+    { "--max-source-pixels",  "N",      "the largest image or video frame the decoder accepts, before any resize\n"
+    "                                    (default 67108864). The media flags above default to what the container\n"
+    "                                    states, and do nothing for a model that takes no media" },
 
     { "--kld-record",         "DIR",    "instead of serving, run --kld-corpus through prefill and write this\n"
     "                                    model's log-probabilities at every scored position to DIR: the\n"
@@ -152,6 +214,104 @@ static std::vector<std::string> split_commas(const std::string& s) {
         i = j + 1;
     }
     return out;
+}
+
+/* A NUMBER IS THE WHOLE ARGUMENT OR IT IS REFUSED. atof reads "high" as 0, and for --temp that is
+ * greedy decoding: a typo that changes every reply and says nothing. */
+static bool parse_num(const char* flag, const char* v, double* out) {
+    char* end = nullptr;
+    errno = 0;
+    const double d = std::strtod(v, &end);
+    if (!*v || !end || *end || errno == ERANGE || !std::isfinite(d)) {
+        RAD_ERR("%s takes a number, not '%s'", flag, v);
+        return false;
+    }
+    *out = d;
+    return true;
+}
+
+static bool parse_int(const char* flag, const char* v, int64_t lo, int64_t hi, int64_t* out) {
+    char* end = nullptr;
+    errno = 0;
+    const long long n = std::strtoll(v, &end, 10);
+    if (!*v || !end || *end || errno == ERANGE) {
+        RAD_ERR("%s takes a whole number, not '%s'", flag, v);
+        return false;
+    }
+    if (n < lo || n > hi) {
+        if (lo > INT32_MIN && (hi == INT32_MAX || hi == INT64_MAX))
+            RAD_ERR("%s must be >= %lld, not %lld", flag, (long long)lo, n);
+        else
+            RAD_ERR("%s must be in [%lld, %lld], not %lld", flag, (long long)lo, (long long)hi, n);
+        return false;
+    }
+    *out = n;
+    return true;
+}
+
+/* A SAMPLER DEFAULT IS CHECKED AGAINST THE RANGE A REQUEST'S OWN VALUE IS (server::sampler_value_ok),
+ * here rather than at the first request. A default outside it would be a 400 on every request
+ * that omits the field -- a server that starts, reports healthy, and answers nothing. */
+static bool sampler_num(const char* flag, const char* field, const char* v, double* out) {
+    if (!parse_num(flag, v, out)) return false;
+    std::string why;
+    if (!server::sampler_value_ok(field, *out, &why)) {
+        RAD_ERR("%s %s: %s %s", flag, v, field, why.c_str());
+        return false;
+    }
+    return true;
+}
+static bool sampler_int(const char* flag, const char* field, const char* v, int* out) {
+    int64_t n = 0;
+    double d = 0;
+    if (!parse_int(flag, v, INT32_MIN, INT32_MAX, &n) || !sampler_num(flag, field, v, &d))
+        return false;
+    *out = (int)n;
+    return true;
+}
+
+/* THE NAMES THE RENDERER SETS ITSELF. The template context is built from these and the variables
+ * are written over them (common_chat_template_direct_apply_impl), so a variable by one of these
+ * names would replace the conversation, the tools or the special tokens of every request. */
+static const char* const kTemplateOwnNames[] = {
+    "messages", "tools", "bos_token", "eos_token", "add_generation_prompt",
+};
+
+/* --chat-template-kwargs: a JSON object, or @FILE holding one, merged key by key into `out`. */
+static bool parse_template_kwargs(const char* v, std::map<std::string, std::string>* out) {
+    std::string text = v;
+    std::string src = "--chat-template-kwargs";
+    if (!text.empty() && text[0] == '@') {
+        std::ifstream f(text.substr(1), std::ios::binary);
+        if (!f) {
+            RAD_ERR("--chat-template-kwargs %s: cannot read %s", v, text.c_str() + 1);
+            return false;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        src += " " + text.substr(1);
+        text = ss.str();
+    }
+    const nlohmann::json j = nlohmann::json::parse(text, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) {
+        RAD_ERR("%s takes a JSON object, such as '{\"enable_thinking\": false}'", src.c_str());
+        return false;
+    }
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        for (const char* own : kTemplateOwnNames)
+            if (it.key() == own) {
+                RAD_ERR("%s: '%s' is set by the server for every request and cannot be a template "
+                        "variable", src.c_str(), own);
+                return false;
+            }
+        if (it.key() == "enable_thinking" && !it.value().is_boolean()) {
+            RAD_ERR("%s: enable_thinking takes true or false", src.c_str());
+            return false;
+        }
+        /* dump(): the template context takes JSON, so a string arrives still quoted. */
+        (*out)[it.key()] = it.value().dump();
+    }
+    return true;
 }
 
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown
@@ -293,30 +453,152 @@ int config_parse(int argc, char** argv, Config* c) {
                                                  c->generation_config = v; }
         else if (S("--override-chat-template")) { if (!(v = need(i))) return RAD_E_INVAL;
                                                  c->override_chat_template = v; }
-        /* A NEGATIVE VALUE IS REFUSED HERE, not left to the range checks below: the fields use
-         * a negative number to mean "not set", so `--temp -0.5` would otherwise be read as no
-         * flag at all and the container's default served in its place. */
-        else if (S("--temp"))                  { if (!(v = need(i))) return RAD_E_INVAL;
-                                                 c->sample_temp = (float)atof(v);
-                                                 if (!(c->sample_temp >= 0.0f)) {
-                                                     RAD_ERR("--temp must be in [0, 2], not '%s'", v);
-                                                     return RAD_E_INVAL; } }
+        /* A NEGATIVE VALUE IS REFUSED BY THE RANGE: these four fields use a negative number to
+         * mean "not set", so `--temp -0.5` taken as given would be read as no flag at all and
+         * the container's default served in its place. */
+        else if (S("--temp") || S("--top-p") || S("--min-p")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const char* field = S("--temp") ? "temperature" : S("--top-p") ? "top_p" : "min_p";
+            double d = 0;
+            if (!sampler_num(a.c_str(), field, v, &d)) return RAD_E_INVAL;
+            (S("--temp") ? c->sample_temp : S("--top-p") ? c->sample_top_p : c->sample_min_p) = (float)d;
+        }
         else if (S("--top-k"))                 { if (!(v = need(i))) return RAD_E_INVAL;
-                                                 c->sample_top_k = atoi(v);
-                                                 if (c->sample_top_k < 0) {
-                                                     RAD_ERR("--top-k must be >= 0 (0 disables "
-                                                             "it), not '%s'", v);
-                                                     return RAD_E_INVAL; } }
-        else if (S("--top-p"))                 { if (!(v = need(i))) return RAD_E_INVAL;
-                                                 c->sample_top_p = (float)atof(v);
-                                                 if (!(c->sample_top_p >= 0.0f)) {
-                                                     RAD_ERR("--top-p must be in (0, 1], not '%s'", v);
-                                                     return RAD_E_INVAL; } }
-        else if (S("--min-p"))                 { if (!(v = need(i))) return RAD_E_INVAL;
-                                                 c->sample_min_p = (float)atof(v);
-                                                 if (!(c->sample_min_p >= 0.0f)) {
-                                                     RAD_ERR("--min-p must be in [0, 1], not '%s'", v);
-                                                     return RAD_E_INVAL; } }
+                                                 if (!sampler_int("--top-k", "top_k", v, &c->sample_top_k))
+                                                     return RAD_E_INVAL; }
+        else if (S("--typical-p") || S("--presence-penalty") || S("--frequency-penalty") ||
+                 S("--repetition-penalty") || S("--dry-multiplier") || S("--dry-base") ||
+                 S("--xtc-probability") || S("--xtc-threshold")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            struct F { const char* flag; const char* field; std::optional<float> Config::* m; };
+            static const F kF[] = {
+                { "--typical-p",          "typical_p",          &Config::sample_typical_p },
+                { "--presence-penalty",   "presence_penalty",   &Config::sample_pres_penalty },
+                { "--frequency-penalty",  "frequency_penalty",  &Config::sample_freq_penalty },
+                { "--repetition-penalty", "repetition_penalty", &Config::sample_rep_penalty },
+                { "--dry-multiplier",     "dry_multiplier",     &Config::sample_dry_multiplier },
+                { "--dry-base",           "dry_base",           &Config::sample_dry_base },
+                { "--xtc-probability",    "xtc_probability",    &Config::sample_xtc_probability },
+                { "--xtc-threshold",      "xtc_threshold",      &Config::sample_xtc_threshold },
+            };
+            for (const F& f : kF) {
+                if (!S(f.flag)) continue;
+                double d = 0;
+                if (!sampler_num(f.flag, f.field, v, &d)) return RAD_E_INVAL;
+                c->*f.m = (float)d;
+            }
+        }
+        else if (S("--repeat-last-n") || S("--dry-allowed-length") || S("--dry-penalty-last-n")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const char* field = S("--repeat-last-n") ? "repeat_last_n"
+                              : S("--dry-allowed-length") ? "dry_allowed_length"
+                                                          : "dry_penalty_last_n";
+            int n = 0;
+            if (!sampler_int(a.c_str(), field, v, &n)) return RAD_E_INVAL;
+            (S("--repeat-last-n") ? c->sample_penalty_last_n
+             : S("--dry-allowed-length") ? c->sample_dry_allowed_length
+                                         : c->sample_dry_penalty_last_n) = n;
+        }
+        else if (S("--dry-sequence-breakers")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const nlohmann::json j = nlohmann::json::parse(v, nullptr, false);
+            bool strings = j.is_array();
+            if (strings) for (const auto& e : j) strings = strings && e.is_string();
+            if (!strings) {
+                RAD_ERR("--dry-sequence-breakers takes a JSON array of strings, such as "
+                        "'[\"\\n\", \":\"]', not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            /* The sampler refuses a DRY request with more (sample/host_ref.h), and every request
+             * leaving the field to this default would be that request. */
+            if (j.size() > kDryMaxBreakers) {
+                RAD_ERR("--dry-sequence-breakers holds %zu strings; the sampler takes at most %zu",
+                        j.size(), kDryMaxBreakers);
+                return RAD_E_INVAL;
+            }
+            c->sample_dry_seq_breakers = j.get<std::vector<std::string>>();
+        }
+        else if (S("--default-max-tokens")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->default_max_tokens = 0;
+            else if (!parse_int(a.c_str(), v, 1, INT32_MAX, &c->default_max_tokens)) {
+                RAD_ERR("--default-max-tokens takes a token count >= 1, or auto");
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--max-tokens-cap"))        { if (!(v = need(i)) ||
+                                                     !parse_int(a.c_str(), v, 0, INT32_MAX, &c->max_tokens_cap))
+                                                     return RAD_E_INVAL; }
+        else if (S("--max-n"))                 { if (!(v = need(i)) ||
+                                                     !parse_int(a.c_str(), v, 1, INT32_MAX, &c->max_n))
+                                                     return RAD_E_INVAL; }
+        else if (S("--max-queued-requests"))   { if (!(v = need(i)) ||
+                                                     !parse_int(a.c_str(), v, 1, INT32_MAX, &c->max_queued_requests))
+                                                     return RAD_E_INVAL; }
+        else if (S("--max-stop-strings"))      { if (!(v = need(i)) ||
+                                                     !parse_int(a.c_str(), v, 1, INT32_MAX, &c->max_stop_strings))
+                                                     return RAD_E_INVAL; }
+        else if (S("--max-stop-bytes"))        { if (!(v = need(i)) ||
+                                                     !parse_int(a.c_str(), v, 1, INT32_MAX, &c->max_stop_bytes))
+                                                     return RAD_E_INVAL; }
+        else if (S("--chat-template-kwargs"))  { if (!(v = need(i)) ||
+                                                     !parse_template_kwargs(v, &c->chat_template_kwargs))
+                                                     return RAD_E_INVAL; }
+        else if (S("--reasoning-format")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* Two values, because the reply reader makes one distinction: whether a reasoning
+             * block is lifted out of the content or left in it. */
+            if (std::strcmp(v, "auto") && std::strcmp(v, "none")) {
+                RAD_ERR("--reasoning-format takes auto or none, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->reasoning_format = v;
+        }
+        else if (S("--http-threads") || S("--read-timeout") || S("--write-timeout") ||
+                 S("--keep-alive-timeout") || S("--retry-after")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* The transport keeps at least four workers whatever it is told (server/http.cpp);
+             * fewer would be a number this flag accepted and the server did not serve. */
+            const int64_t lo = S("--http-threads") ? 4 : S("--retry-after") ? 0 : 1;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, lo, INT32_MAX, &n)) return RAD_E_INVAL;
+            (S("--http-threads")    ? c->http_threads
+             : S("--read-timeout")  ? c->http_read_timeout_s
+             : S("--write-timeout") ? c->http_write_timeout_s
+             : S("--retry-after")   ? c->retry_after_s
+                                    : c->http_keep_alive_timeout_s) = (int)n;
+        }
+        else if (S("--max-body-mib"))          { if (!(v = need(i)) ||
+                                                     !parse_int(a.c_str(), v, 1, (int64_t)1 << 20, &c->http_max_body_mib))
+                                                     return RAD_E_INVAL; }
+        else if (S("--no-cors"))               c->cors = false;
+        else if (S("--image-min-pixels") || S("--image-max-pixels") || S("--video-min-pixels") ||
+                 S("--video-max-pixels") || S("--max-source-pixels")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, 1, INT64_MAX, &n)) return RAD_E_INVAL;
+            (S("--image-min-pixels")   ? c->image_min_pixels
+             : S("--image-max-pixels") ? c->image_max_pixels
+             : S("--video-min-pixels") ? c->video_min_pixels
+             : S("--video-max-pixels") ? c->video_max_pixels
+                                       : c->max_source_pixels) = n;
+        }
+        else if (S("--video-fps")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (!(d > 0.0)) { RAD_ERR("--video-fps must be > 0, not '%s'", v); return RAD_E_INVAL; }
+            c->video_fps = d;
+        }
+        else if (S("--video-min-frames") || S("--video-max-frames") || S("--video-max-frame-tokens")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            int64_t n = 0;
+            if (!parse_int(a.c_str(), v, S("--video-max-frame-tokens") ? 0 : 1, INT32_MAX, &n))
+                return RAD_E_INVAL;
+            (S("--video-min-frames")   ? c->video_min_frames
+             : S("--video-max-frames") ? c->video_max_frames
+                                       : c->video_max_frame_tokens) = (int32_t)n;
+        }
         else if (S("--kld-record"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_record = v; }
         else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
         else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
@@ -386,15 +668,42 @@ int config_parse(int argc, char** argv, Config* c) {
         return RAD_E_INVAL;
     }
 
-    /* THE SAME RANGES THE REQUEST PARSER ENFORCES, and refused here rather than at the first
-     * request. A default outside them would otherwise be a 400 on every request that omits the
-     * field -- a server that starts, reports healthy, and answers nothing. */
-    if (c->sample_temp >= 0.0f && c->sample_temp > 2.0f) {
-        RAD_ERR("--temp must be in [0, 2]"); return RAD_E_INVAL; }
-    if (c->sample_top_p >= 0.0f && !(c->sample_top_p > 0.0f && c->sample_top_p <= 1.0f)) {
-        RAD_ERR("--top-p must be in (0, 1]"); return RAD_E_INVAL; }
-    if (c->sample_min_p >= 0.0f && c->sample_min_p > 1.0f) {
-        RAD_ERR("--min-p must be in [0, 1]"); return RAD_E_INVAL; }
+    /* TWO FLAGS THAT WOULD SAY THE SAME THING. --reasoning-effort is a template variable with one
+     * extra meaning ("none" is enable_thinking false), so naming either key in
+     * --chat-template-kwargs as well leaves two defaults for one setting and no order to read. */
+    if (!c->reasoning_effort.empty() &&
+        (c->chat_template_kwargs.count("reasoning_effort") ||
+         c->chat_template_kwargs.count("enable_thinking"))) {
+        RAD_ERR("--reasoning-effort and a reasoning_effort or enable_thinking key in "
+                "--chat-template-kwargs both set the default for thinking; give one");
+        return RAD_E_INVAL;
+    }
+    if (c->default_max_tokens > 0 && c->max_tokens_cap > 0 &&
+        c->default_max_tokens > c->max_tokens_cap) {
+        RAD_ERR("--default-max-tokens %lld is above --max-tokens-cap %lld, so no request could be "
+                "served at the default", (long long)c->default_max_tokens,
+                (long long)c->max_tokens_cap);
+        return RAD_E_INVAL;
+    }
+    /* A request is admitted only if all its choices fit the queue, so an `n` past it would be a
+     * 429 however long the caller waited. Checked only when one of the two was stated: the
+     * defaults (8, or --max-num-seqs; and 8 x --max-num-seqs) always fit. */
+    if (c->max_n > 0 || c->max_queued_requests > 0) {
+        const int64_t n = c->max_n > 0 ? c->max_n : std::max<int64_t>(8, c->max_seqs);
+        const int64_t q = c->max_queued_requests > 0 ? c->max_queued_requests : c->max_seqs * 8;
+        if (n > q) {
+            RAD_ERR("--max-n %lld is above the %lld requests the queue admits "
+                    "(--max-queued-requests), so a request asking for it could never be admitted",
+                    (long long)n, (long long)q);
+            return RAD_E_INVAL;
+        }
+    }
+    if (c->image_min_pixels && c->image_max_pixels && *c->image_min_pixels > *c->image_max_pixels) {
+        RAD_ERR("--image-min-pixels is above --image-max-pixels"); return RAD_E_INVAL; }
+    if (c->video_min_pixels && c->video_max_pixels && *c->video_min_pixels > *c->video_max_pixels) {
+        RAD_ERR("--video-min-pixels is above --video-max-pixels"); return RAD_E_INVAL; }
+    if (c->video_min_frames && c->video_max_frames && *c->video_min_frames > *c->video_max_frames) {
+        RAD_ERR("--video-min-frames is above --video-max-frames"); return RAD_E_INVAL; }
 
     return RAD_OK;
 }

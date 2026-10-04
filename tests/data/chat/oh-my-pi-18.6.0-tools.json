@@ -1,0 +1,484 @@
+[
+ {
+  "type": "function",
+  "function": {
+   "name": "read",
+   "description": "read",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "path",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "bash",
+   "description": "bash",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "command": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "number"
+     },
+     "cwd": {
+      "type": "string"
+     },
+     "pty": {
+      "type": "boolean"
+     },
+     "async": {
+      "type": "boolean"
+     },
+     "name": {
+      "type": "string",
+      "maxLength": 48
+     },
+     "ready": {
+      "type": "object",
+      "properties": {
+       "log": {
+        "type": "string"
+       },
+       "port": {
+        "type": "number"
+       },
+       "host": {
+        "type": "string"
+       },
+       "timeout": {
+        "type": "number"
+       }
+      },
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "command",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "edit",
+   "description": "edit",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "input": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "input",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "eval",
+   "description": "eval",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "language": {
+      "enum": [
+       "py",
+       "js"
+      ],
+      "type": "string"
+     },
+     "code": {
+      "type": "string"
+     },
+     "title": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "number"
+     },
+     "reset": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "language",
+     "code"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "glob",
+   "description": "glob",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     },
+     "hidden": {
+      "type": "boolean"
+     },
+     "gitignore": {
+      "type": "boolean"
+     },
+     "limit": {
+      "type": "number"
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "i"
+    ]
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "grep",
+   "description": "grep",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "pattern": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     },
+     "case": {
+      "type": "boolean"
+     },
+     "gitignore": {
+      "type": "boolean"
+     },
+     "skip": {
+      "type": [
+       "number",
+       "null"
+      ]
+     }
+    },
+    "required": [
+     "pattern",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "task",
+   "description": "task",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "context": {
+      "type": "string"
+     },
+     "tasks": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "task": {
+         "type": "string"
+        },
+        "solutionSpace": {
+         "type": "string"
+        },
+        "name": {
+         "type": "string"
+        },
+        "agent": {
+         "type": "string",
+         "default": "task"
+        },
+        "model": {
+         "anyOf": [
+          {
+           "type": "string"
+          },
+          {
+           "type": "array",
+           "items": {
+            "type": "string"
+           }
+          }
+         ]
+        },
+        "outputSchema": {
+         "anyOf": [
+          {
+           "type": "object"
+          },
+          {
+           "type": "boolean"
+          },
+          {
+           "type": "string"
+          },
+          {
+           "type": "null"
+          }
+         ]
+        },
+        "schemaMode": {
+         "enum": [
+          "permissive",
+          "strict"
+         ],
+         "type": "string"
+        },
+        "tools": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        }
+       },
+       "required": [
+        "task",
+        "solutionSpace"
+       ],
+       "additionalProperties": false
+      }
+     },
+     "model": {
+      "not": {
+       "anyOf": [
+        {
+         "type": "string"
+        },
+        {
+         "type": "number"
+        },
+        {
+         "type": "boolean"
+        },
+        {
+         "type": "object"
+        },
+        {
+         "type": "array"
+        },
+        {
+         "type": "null"
+        }
+       ]
+      }
+     }
+    },
+    "required": [
+     "context",
+     "tasks",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "wait",
+   "description": "wait",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     }
+    },
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "todo",
+   "description": "todo",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "op": {
+      "enum": [
+       "init",
+       "start",
+       "done",
+       "rm",
+       "drop",
+       "block",
+       "unblock",
+       "append",
+       "view"
+      ],
+      "type": "string"
+     },
+     "list": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "phase": {
+         "type": "string"
+        },
+        "items": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "minItems": 1
+        }
+       },
+       "required": [
+        "phase",
+        "items"
+       ],
+       "additionalProperties": false
+      }
+     },
+     "task": {
+      "type": "string"
+     },
+     "phase": {
+      "type": "string"
+     },
+     "items": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "reason": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "op",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "web_search",
+   "description": "web_search",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "query": {
+      "type": "string"
+     },
+     "recency": {
+      "enum": [
+       "day",
+       "week",
+       "month",
+       "year"
+      ],
+      "type": "string"
+     },
+     "limit": {
+      "type": "number"
+     },
+     "max_tokens": {
+      "type": "number"
+     },
+     "temperature": {
+      "type": "number"
+     },
+     "num_search_results": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "query",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "write",
+   "description": "write",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     },
+     "content": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "path",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ }
+]

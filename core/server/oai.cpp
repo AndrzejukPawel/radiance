@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <random>
 
 namespace rad {
@@ -201,7 +202,7 @@ const char* kAcceptedCommon[] = {
 const char* kAcceptedChat[] = {
     "messages", "tools", "tool_choice", "response_format", "top_logprobs",
     "parallel_tool_calls", "add_generation_prompt", "max_completion_tokens",
-    "chat_template_kwargs", "reasoning_effort", "enable_thinking",
+    "chat_template_kwargs", "reasoning_effort", "enable_thinking", "preserve_thinking",
 };
 
 const char* kAcceptedCompletion[] = { "prompt", "echo" };
@@ -311,15 +312,6 @@ bool get_str(const json& b, const char* k, std::string* out, ApiError* err) {
     return true;
 }
 
-bool range(double v, double lo, double hi, const char* k, ApiError* err) {
-    if (v < lo || v > hi) {
-        char b[160];
-        snprintf(b, sizeof b, "must be in [%g, %g], got %g", lo, hi, v);
-        *err = err_bad(k, b);
-        return false;
-    }
-    return true;
-}
 
 /* The body of every generation endpoint: one JSON object, parsed into a bounded tree. */
 int parse_request_object(const std::string& body, const OaiLimits& lim, json* b, ApiError* err) {
@@ -349,10 +341,68 @@ int parse_request_object(const std::string& body, const OaiLimits& lim, json* b,
 
 /* ================================================================== sampling params */
 
+namespace {
+
+/* One row per bounded sampler field. `lo_open` excludes the lower bound; `hi` of infinity is no
+ * upper bound. `why` is the refusal when the range alone does not say it well, and null for a
+ * closed interval, whose refusal names the interval and the value. */
+struct SamplerRange {
+    const char* field;
+    double      lo, hi;
+    bool        lo_open;
+    const char* why;
+};
+
+constexpr double kInf = std::numeric_limits<double>::infinity();
+
+const SamplerRange kSamplerRanges[] = {
+    { "temperature",        0.0,  2.0,  false, nullptr },
+    { "top_p",              0.0,  1.0,  true,  "must be in (0, 1]" },
+    { "top_k",              0.0,  kInf, false, "must be >= 0 (0 disables it)" },
+    { "min_p",              0.0,  1.0,  false, nullptr },
+    { "typical_p",          0.0,  1.0,  true,  "must be in (0, 1]" },
+    { "presence_penalty",   -2.0, 2.0,  false, nullptr },
+    { "frequency_penalty",  -2.0, 2.0,  false, nullptr },
+    { "repetition_penalty", 0.0,  kInf, true,  "must be > 0" },
+    { "repeat_last_n",      -1.0, kInf, false, "must be >= -1" },
+    { "xtc_probability",    0.0,  1.0,  false, nullptr },
+    { "xtc_threshold",      0.0,  1.0,  false, nullptr },
+    { "dry_base",           1.0,  kInf, false, "must be >= 1" },
+    { "dry_penalty_last_n", -1.0, kInf, false, "must be >= -1" },
+};
+
+}  /* namespace */
+
+/* Written as "inside the range" and negated, so a NaN -- which a flag can parse and JSON cannot
+ * carry -- fails every row rather than passing them all. */
+bool sampler_value_ok(const char* field, double v, std::string* why) {
+    for (const SamplerRange& r : kSamplerRanges) {
+        if (std::strcmp(r.field, field)) continue;
+        const bool in = (r.lo_open ? v > r.lo : v >= r.lo) && v <= r.hi;
+        if (in) return true;
+        if (why) {
+            if (r.why) *why = r.why;
+            else {
+                char b[160];
+                snprintf(b, sizeof b, "must be in [%g, %g], got %g", r.lo, r.hi, v);
+                *why = b;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
 static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, ApiError* err) {
     double d;
     int64_t i64;
     bool bl;
+    auto ok = [err](const char* k, double v) {
+        std::string why;
+        if (sampler_value_ok(k, v, &why)) return true;
+        *err = err_bad(k, why);
+        return false;
+    };
 
     /* THE DEPLOYMENT'S DEFAULTS ARE THE SEED, and every field below reads its current value
      * before looking for one in the body -- so a field the request names overrides, and a field
@@ -363,57 +413,57 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
 
     d = r->sp.temp;
     if (!get_num(b, "temperature", &d, err)) return RAD_E_INVAL;
-    if (!range(d, 0.0, 2.0, "temperature", err)) return RAD_E_INVAL;
+    if (!ok("temperature", d)) return RAD_E_INVAL;
     r->sp.temp = (float)d;
 
     d = r->sp.top_p;
     if (!get_num(b, "top_p", &d, err)) return RAD_E_INVAL;
-    if (d <= 0.0 || d > 1.0) { *err = err_bad("top_p", "must be in (0, 1]"); return RAD_E_INVAL; }
+    if (!ok("top_p", d)) return RAD_E_INVAL;
     r->sp.top_p = (float)d;
 
     i64 = r->sp.top_k;
     if (!get_int(b, "top_k", &i64, err)) return RAD_E_INVAL;
-    if (i64 < 0) { *err = err_bad("top_k", "must be >= 0 (0 disables it)"); return RAD_E_INVAL; }
+    if (!ok("top_k", (double)i64)) return RAD_E_INVAL;
     r->sp.top_k = (int)i64;
 
     d = r->sp.min_p;
     if (!get_num(b, "min_p", &d, err)) return RAD_E_INVAL;
-    if (!range(d, 0.0, 1.0, "min_p", err)) return RAD_E_INVAL;
+    if (!ok("min_p", d)) return RAD_E_INVAL;
     r->sp.min_p = (float)d;
 
     d = r->sp.typical_p;
     if (!get_num(b, "typical_p", &d, err)) return RAD_E_INVAL;
-    if (d <= 0.0 || d > 1.0) { *err = err_bad("typical_p", "must be in (0, 1]"); return RAD_E_INVAL; }
+    if (!ok("typical_p", d)) return RAD_E_INVAL;
     r->sp.typical_p = (float)d;
 
     d = r->sp.pres_penalty;
     if (!get_num(b, "presence_penalty", &d, err)) return RAD_E_INVAL;
-    if (!range(d, -2.0, 2.0, "presence_penalty", err)) return RAD_E_INVAL;
+    if (!ok("presence_penalty", d)) return RAD_E_INVAL;
     r->sp.pres_penalty = (float)d;
 
     d = r->sp.freq_penalty;
     if (!get_num(b, "frequency_penalty", &d, err)) return RAD_E_INVAL;
-    if (!range(d, -2.0, 2.0, "frequency_penalty", err)) return RAD_E_INVAL;
+    if (!ok("frequency_penalty", d)) return RAD_E_INVAL;
     r->sp.freq_penalty = (float)d;
 
     d = r->sp.rep_penalty;
     if (!get_num(b, "repetition_penalty", &d, err)) return RAD_E_INVAL;
-    if (d <= 0.0) { *err = err_bad("repetition_penalty", "must be > 0"); return RAD_E_INVAL; }
+    if (!ok("repetition_penalty", d)) return RAD_E_INVAL;
     r->sp.rep_penalty = (float)d;
 
     i64 = r->sp.penalty_last_n;
     if (!get_int(b, "repeat_last_n", &i64, err)) return RAD_E_INVAL;
-    if (i64 < -1) { *err = err_bad("repeat_last_n", "must be >= -1"); return RAD_E_INVAL; }
+    if (!ok("repeat_last_n", (double)i64)) return RAD_E_INVAL;
     r->sp.penalty_last_n = (int)i64;
 
     d = r->sp.xtc_probability;
     if (!get_num(b, "xtc_probability", &d, err)) return RAD_E_INVAL;
-    if (!range(d, 0.0, 1.0, "xtc_probability", err)) return RAD_E_INVAL;
+    if (!ok("xtc_probability", d)) return RAD_E_INVAL;
     r->sp.xtc_probability = (float)d;
 
     d = r->sp.xtc_threshold;
     if (!get_num(b, "xtc_threshold", &d, err)) return RAD_E_INVAL;
-    if (!range(d, 0.0, 1.0, "xtc_threshold", err)) return RAD_E_INVAL;
+    if (!ok("xtc_threshold", d)) return RAD_E_INVAL;
     r->sp.xtc_threshold = (float)d;
 
     d = r->sp.dry_multiplier;
@@ -421,14 +471,14 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     r->sp.dry_multiplier = (float)d;
     d = r->sp.dry_base;
     if (!get_num(b, "dry_base", &d, err)) return RAD_E_INVAL;
-    if (d < 1.0) { *err = err_bad("dry_base", "must be >= 1"); return RAD_E_INVAL; }
+    if (!ok("dry_base", d)) return RAD_E_INVAL;
     r->sp.dry_base = (float)d;
     i64 = r->sp.dry_allowed_length;
     if (!get_int(b, "dry_allowed_length", &i64, err)) return RAD_E_INVAL;
     r->sp.dry_allowed_length = (int)i64;
     i64 = r->sp.dry_penalty_last_n;
     if (!get_int(b, "dry_penalty_last_n", &i64, err)) return RAD_E_INVAL;
-    if (i64 < -1) { *err = err_bad("dry_penalty_last_n", "must be >= -1"); return RAD_E_INVAL; }
+    if (!ok("dry_penalty_last_n", (double)i64)) return RAD_E_INVAL;
     r->sp.dry_penalty_last_n = (int)i64;
 
     /* ABSENT MEANS llama.cpp's FOUR, not none. A client that turns DRY on and names no breakers
@@ -437,7 +487,8 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
      * with DRY off: the sampler resolves breakers only for a request that runs DRY. */
     auto dsb = b.find("dry_sequence_breakers");
     if (dsb == b.end() || dsb->is_null()) {
-        if (r->sp.dry_seq_breakers.empty()) r->sp.dry_seq_breakers = { "\n", ":", "\"", "*" };
+        if (r->sp.dry_seq_breakers.empty() && !lim.default_dry_breakers_set)
+            r->sp.dry_seq_breakers = { "\n", ":", "\"", "*" };
     } else {
         r->sp.dry_seq_breakers.clear();
         if (!dsb->is_array()) {
@@ -500,14 +551,15 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
      * text a choice produces -- by the decoder and again by the server's own scan -- so what one
      * request costs per token is its number of stop strings times the longest of them. OpenAI
      * allows four. The bounds here are far past anything a client sends and exist so that no
-     * request can buy that scan without limit. */
-    constexpr size_t kMaxStops = 64, kMaxStopBytes = 4096;
+     * request can buy that scan without limit. The deployment may move them (--max-stop-strings,
+     * --max-stop-bytes). */
+    const size_t max_stops = (size_t)lim.max_stops, max_stop_bytes = (size_t)lim.max_stop_bytes;
     auto st = b.find("stop");
     if (st != b.end() && !st->is_null()) {
         if (st->is_string()) r->stop.push_back(st->get<std::string>());
         else if (st->is_array()) {
-            if (st->size() > kMaxStops) {
-                *err = err_bad("stop", "at most " + std::to_string(kMaxStops) +
+            if (st->size() > max_stops) {
+                *err = err_bad("stop", "at most " + std::to_string(max_stops) +
                                            " stop strings are accepted, got " +
                                            std::to_string(st->size()));
                 return RAD_E_INVAL;
@@ -524,9 +576,9 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
             return RAD_E_INVAL;
         }
         for (const auto& s : r->stop) {
-            if (s.size() > kMaxStopBytes) {
+            if (s.size() > max_stop_bytes) {
                 *err = err_bad("stop", "a stop string may be at most " +
-                                           std::to_string(kMaxStopBytes) + " bytes, got one of " +
+                                           std::to_string(max_stop_bytes) + " bytes, got one of " +
                                            std::to_string(s.size()));
                 return RAD_E_INVAL;
             }
@@ -563,15 +615,54 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
  * caller who sends the kwarg and nothing else has it silently overwritten with the default true,
  * and sees the model think anyway -- a 200 that did not honour the request, which is the one
  * outcome this file's header forbids. Lifting the kwarg into the field is what makes it real.
+ *
+ * THE DEPLOYMENT'S DEFAULTS GO IN FIRST AND THE REQUEST OVERWRITES THEM, key by key -- except that
+ * thinking is one setting with three spellings, and a default in one spelling must not survive a
+ * request that used another. A request that says anything about thinking (either enable_thinking,
+ * or a reasoning effort) drops the deployment's enable_thinking; one that names an effort drops
+ * the deployment's effort too. Otherwise `--chat-template-kwargs '{"enable_thinking":false}'`
+ * would turn off thinking for a caller who sent `reasoning_effort: "high"`, and
+ * `--reasoning-effort none` would do the same to one who sent `enable_thinking: true`.
  */
+RequestThinking request_thinking(const json& b) {
+    auto kw = b.find("chat_template_kwargs");
+    const bool obj = kw != b.end() && kw->is_object();
+    auto top = b.find("enable_thinking");
+    /* An empty reasoning_effort string reads as unset, so it names no effort either. */
+    auto re = b.find("reasoning_effort");
+    RequestThinking t;
+    t.effort = (obj && kw->contains("reasoning_effort")) ||
+               (re != b.end() && re->is_string() && !re->get<std::string>().empty());
+    t.thinking = t.effort || (top != b.end() && !top->is_null()) ||
+                 (obj && kw->contains("enable_thinking"));
+    return t;
+}
+
+void apply_template_defaults(const json& b, const OaiLimits& lim, ChatRenderOptions* opt) {
+    const RequestThinking says = request_thinking(b);
+    for (const auto& [k, v] : lim.default_template_kwargs) {
+        if (k == "enable_thinking") {
+            if (says.thinking) continue;
+            opt->enable_thinking = v == "true";
+        }
+        if (k == "reasoning_effort" && says.effort) continue;
+        opt->template_kwargs[k] = v;
+    }
+    opt->reasoning_format = lim.reasoning_format;
+}
+
 static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions* opt,
                           ApiError* err) {
     auto kw = b.find("chat_template_kwargs");
-    if (kw != b.end() && !kw->is_null()) {
-        if (!kw->is_object()) {
-            *err = err_bad("chat_template_kwargs", "expected an object");
-            return RAD_E_INVAL;
-        }
+    const bool has_kw = kw != b.end() && !kw->is_null();
+    if (has_kw && !kw->is_object()) {
+        *err = err_bad("chat_template_kwargs", "expected an object");
+        return RAD_E_INVAL;
+    }
+    const RequestThinking says = request_thinking(b);
+    apply_template_defaults(b, lim, opt);
+
+    if (has_kw) {
         for (auto it = kw->begin(); it != kw->end(); ++it) {
             /* dump(), not get<string>(): the template context wants JSON, so a string value has
              * to arrive still quoted. See ChatRenderOptions. */
@@ -590,6 +681,21 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
     if (!get_bool(b, "enable_thinking", &think, err)) return RAD_E_INVAL;
     opt->enable_thinking = think;
 
+    /* `preserve_thinking` AT THE TOP LEVEL is the template variable of that name, the same
+     * shorthand `enable_thinking` is: llama.cpp maps the field into the template, and clients
+     * written against it (oh-my-pi, for every Qwen model) send it there as well as in
+     * chat_template_kwargs. The Qwen3.6 and later templates read it to keep earlier assistant
+     * turns' reasoning in the prompt; a template that does not read it ignores it, as it ignores
+     * any variable it does not name. Like enable_thinking, the top-level spelling wins. */
+    auto pt = b.find("preserve_thinking");
+    if (pt != b.end() && !pt->is_null()) {
+        if (!pt->is_boolean()) {
+            *err = err_bad("preserve_thinking", "expected a boolean");
+            return RAD_E_INVAL;
+        }
+        opt->template_kwargs["preserve_thinking"] = pt->dump();
+    }
+
     /* REASONING EFFORT IS THE TEMPLATE'S VOCABULARY, NOT OURS, so there is no allow-list here.
      * One would be wrong in both directions: OpenAI's ladder is none/minimal/low/medium/high,
      * while a model's template may accept a different set -- Qwen3.8's takes xhigh/medium/low and
@@ -607,8 +713,14 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
     std::string effort;
     if (!get_str(b, "reasoning_effort", &effort, err)) return RAD_E_INVAL;
     /* The deployment's default, where the request did not say. Last, so every explicit spelling
-     * above it wins; emplace, so a chat_template_kwargs entry that already set the key stands. */
-    if (effort.empty()) effort = lim.default_reasoning_effort;
+     * above it wins; emplace, so a chat_template_kwargs entry that already set the key stands.
+     * "none" and "minimal" are an enable_thinking default, so any word about thinking drops them;
+     * a level is an effort default, dropped by an effort. */
+    if (effort.empty()) {
+        const std::string& def = lim.default_reasoning_effort;
+        const bool off = def == "none" || def == "minimal";
+        if (off ? !says.thinking : !says.effort) effort = def;
+    }
     if (!effort.empty()) {
         if (effort == "none" || effort == "minimal") opt->enable_thinking = false;
         else opt->template_kwargs.emplace("reasoning_effort", json(effort).dump());
@@ -1005,8 +1117,16 @@ static int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
  * anyway. What the caller gets back still says so: the completion ends with finish_reason
  * "length" and `usage` reports the tokens it actually produced.
  */
+/* THE DEPLOYMENT'S CAP IS A THIRD BOUND OF THE SAME KIND, clamped for the same reason: a request
+ * asking for more than the operator allows is still a request worth serving up to the cap. And a
+ * max_tokens of 0 is the `--default-max-tokens auto` default, which is "what the context leaves" --
+ * resolved here, against this prompt, so that the scheduler always sees a finite bound. */
 static int clamp_max_tokens(size_t n_prompt, const OaiLimits& lim, const char* field,
                             OaiRequest* out, ApiError* err) {
+    if (lim.max_tokens_cap > 0 &&
+        (out->max_tokens <= 0 || (int64_t)out->max_tokens > lim.max_tokens_cap))
+        out->max_tokens = (int32_t)lim.max_tokens_cap;
+
     if (lim.max_ctx <= 0) return RAD_OK;          /* no bound declared, nothing to clamp against */
 
     const int64_t room = lim.max_ctx - (int64_t)n_prompt;
@@ -1021,7 +1141,9 @@ static int clamp_max_tokens(size_t n_prompt, const OaiLimits& lim, const char* f
         return RAD_E_INVAL;
     }
 
-    if ((int64_t)out->max_tokens > room) {
+    if (out->max_tokens <= 0) {
+        out->max_tokens = (int32_t)std::min<int64_t>(room, INT32_MAX);
+    } else if ((int64_t)out->max_tokens > room) {
         /* Debug rather than Warn: on a long-context deployment whose clients send a constant
          * max_tokens this fires on every request that is working correctly, and a line printed
          * per request is how a server's log stops being read at all. */

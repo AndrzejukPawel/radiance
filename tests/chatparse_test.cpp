@@ -916,6 +916,37 @@ TEST(an_argument_no_value_satisfies_has_no_arm_in_either_grammar) {
     CHECK_EQ(g.text, b->prompt().grammar);
 }
 
+/* OH-MY-PI 18.6.0's TOOLS AS AN UNMODIFIED CLIENT SENDS THEM (tests/data/chat), descriptions aside.
+ * Its `task` tool spells the optional `model` as the `not` of a union of all six JSON types rather
+ * than `{"not": {}}`, which is `never` all the same; the declared format must give it no arm and
+ * agree with the derived format about the whole tool set, as it does about every other. */
+TEST(oh_my_pis_tools_build_the_same_grammar_in_either_format) {
+    std::ifstream f(std::string(RAD_CHAT_FIXTURES) + "/oh-my-pi-18.6.0-tools.json");
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    const json tools = json::parse(ss.str());
+    REQUIRE(tools.is_array() && tools.size() == 11);
+
+    RadChatFormat c = qwen_abi();
+    ChatFormat declared;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(&c, &declared, &why));
+    ChatGrammarRequest gq;
+    gq.tools = &tools;
+    ChatGrammar g;
+    CHECK_OK(chat_format_grammar(declared, gq, &g, &why));
+    if (!why.empty()) fprintf(stderr, "    %s\n", why.c_str());
+    CHECK(!g.text.empty());
+    CHECK(g.text.find("task-arg-model") == std::string::npos);
+    CHECK(g.text.find("task-arg-tasks") != std::string::npos);
+
+    Bench* b = bench(models()[0], ChatRequest{}, tools);
+    if (!b) return;
+    gq.generation_prompt = b->prompt().generation_prompt;
+    CHECK_OK(chat_format_grammar(declared, gq, &g, &why));
+    CHECK_EQ(g.text, b->prompt().grammar);
+}
+
 /* THE STRUCT GROWS AT ITS END. A plugin built against a header with fewer fields reports a smaller
  * struct_size, and the fields past it read as zero; one built against a larger header has its
  * extra fields ignored. Nothing is read past what the plugin said it has. */

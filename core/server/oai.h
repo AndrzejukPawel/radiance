@@ -21,6 +21,7 @@
 #include "sink.h"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -107,8 +108,15 @@ struct OaiRequest {
 struct OaiLimits {
     std::string model_id = "radiance";
     int64_t     max_ctx = 0;              /* 0 = unknown, no length check */
+    /* What a request that names no max_tokens may generate. 0 is "whatever the context leaves",
+     * resolved against the prompt in clamp_max_tokens. */
     int64_t     default_max_tokens = 512;
+    /* The most any request may generate; a larger max_tokens is clamped, not refused. 0 = none. */
+    int64_t     max_tokens_cap = 0;
     int         max_n = 8;
+    /* How many stop strings a request may send, and how long each may be. */
+    int64_t     max_stops = 64;
+    int64_t     max_stop_bytes = 4096;
     bool        allow_image = false;
     bool        allow_video = false;
     bool        allow_audio = false;
@@ -137,7 +145,39 @@ struct OaiLimits {
      * after this is copied. A request that names a field always wins, exactly as with
      * default_reasoning_effort. */
     SamplingParams default_sampling;
+    /* SamplingParams cannot tell an empty breaker list that was stated from one that was not, and
+     * the two mean different things: unstated is llama-server's four, stated-empty is none. */
+    bool           default_dry_breakers_set = false;
+
+    /* THE DEPLOYMENT'S CHAT TEMPLATE VARIABLES, key -> JSON text, applied under the request's own
+     * chat_template_kwargs so a key the request names is the request's. The thinking keys follow
+     * parse_thinking's rule: a request that says anything about thinking replaces them whole. */
+    std::map<std::string, std::string> default_template_kwargs;
+    /* "auto" returns reasoning as reasoning_content; "none" leaves it inline in content. */
+    std::string reasoning_format = "auto";
 };
+
+/* WHAT A REQUEST SAYS ABOUT THINKING, in any of its three spellings: `effort` when it names a
+ * reasoning effort (top-level or in chat_template_kwargs, non-empty), `thinking` when it says
+ * anything at all -- an effort, or enable_thinking in either place. */
+struct RequestThinking {
+    bool thinking = false;
+    bool effort = false;
+};
+RequestThinking request_thinking(const json& b);
+
+/* The deployment's template variables and reply format, onto `opt`, before the request's own
+ * chat_template_kwargs are written over them. A request that says anything about thinking keeps
+ * the deployment's enable_thinking out; one that names an effort keeps its reasoning_effort out.
+ * The chat endpoint and /tokenize both render through this, so a prompt counted by one is the
+ * prompt served by the other. */
+void apply_template_defaults(const json& b, const OaiLimits& lim, ChatRenderOptions* opt);
+
+/* True when `v` is a legal value of the sampler field a request spells `field`; otherwise `why`
+ * says what the legal set is, in the words a 400 carries. The same table checks a request and the
+ * command-line flag that sets the field's default, so a default the command line accepts is one
+ * every request omitting the field can be served with. A field with no bounds takes any value. */
+bool sampler_value_ok(const char* field, double v, std::string* why);
 
 struct OaiDeps {
     ITokenizer*       tok = nullptr;

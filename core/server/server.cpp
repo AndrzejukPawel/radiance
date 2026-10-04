@@ -47,13 +47,19 @@ Server::Server(const Deps& d, const ServerOptions& o)
     lim_.model_id = opt_.model_id;
     lim_.max_ctx = opt_.max_ctx;
     lim_.default_max_tokens = opt_.default_max_tokens;
+    lim_.max_tokens_cap = opt_.max_tokens_cap;
     lim_.max_n = opt_.max_n;
+    lim_.max_stops = opt_.max_stops;
+    lim_.max_stop_bytes = opt_.max_stop_bytes;
     lim_.allow_image = opt_.allow_image;
     lim_.allow_video = opt_.allow_video;
     lim_.allow_audio = opt_.allow_audio;
     lim_.supports_logprobs = opt_.supports_logprobs;
     lim_.default_reasoning_effort = opt_.default_reasoning_effort;
     lim_.default_sampling = opt_.default_sampling;
+    lim_.default_dry_breakers_set = opt_.default_dry_breakers_set;
+    lim_.default_template_kwargs = opt_.default_template_kwargs;
+    lim_.reasoning_format = opt_.reasoning_format;
 
     odeps_.tok = deps_.tok;
     odeps_.chat = deps_.chat;
@@ -158,7 +164,33 @@ int Server::run() {
     t.max_queued = kSpareWorkers;
     t.api_key = opt_.api_key;
     t.cors = opt_.cors;
+    t.read_timeout_s = opt_.read_timeout_s;
+    t.write_timeout_s = opt_.write_timeout_s;
+    t.keep_alive_timeout_s = opt_.keep_alive_timeout_s;
+    t.max_body_bytes = opt_.max_body_bytes;
     return transport_.serve(router_, t);
+}
+
+void Server::check_template_defaults(std::string* kwargs_why, std::string* effort_why) const {
+    kwargs_why->clear();
+    effort_why->clear();
+    if (!deps_.chat) return;
+    const std::string body = R"({"messages":[{"role":"user","content":"Hello"}],"max_tokens":1})";
+    auto render = [&](const OaiLimits& l, std::string* why) {
+        OaiRequest r;
+        ApiError e;
+        if (parse_chat_request(body, odeps_, l, &r, &e) >= 0) return true;
+        if (why) *why = e.message;
+        return false;
+    };
+    OaiLimits l = lim_;
+    l.default_template_kwargs.clear();
+    l.default_reasoning_effort.clear();
+    if (!render(l, nullptr)) return;
+    l.default_template_kwargs = lim_.default_template_kwargs;
+    if (!l.default_template_kwargs.empty() && !render(l, kwargs_why)) return;
+    l.default_reasoning_effort = lim_.default_reasoning_effort;
+    if (!l.default_reasoning_effort.empty()) render(l, effort_why);
 }
 
 void Server::stop() {

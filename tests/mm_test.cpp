@@ -303,4 +303,33 @@ TEST(every_admitted_video_format_decodes) {
     }
 }
 
+/* THE BANDS ARE CHECKED AS A WHOLE, because the command line can replace one end of a band and
+ * leave the other to the container: a minimum stated alone can land above the container's maximum. */
+TEST(a_media_configuration_with_an_empty_band_names_it) {
+    mm::VisionConfig c;
+    c.image_min_pixels = 65536;
+    c.image_max_pixels = 16777216;
+    c.video_min_pixels = 4096;
+    c.video_max_pixels = 25165824;
+    std::string why;
+    CHECK_EQ(c.check(&why), RAD_OK);
+
+    mm::VisionConfig b = c;
+    b.image_min_pixels = 32 << 20;
+    CHECK_EQ(b.check(&why), RAD_E_INVAL);
+    CHECK(why.find("image_max_pixels") != std::string::npos);
+    b = c;
+    b.video_max_pixels = 1000;
+    CHECK_EQ(b.check(&why), RAD_E_INVAL);
+    CHECK(why.find("video_max_pixels") != std::string::npos);
+    b = c;
+    b.fps = 0.0;
+    CHECK_EQ(b.check(&why), RAD_E_INVAL);
+    b = c;
+    b.min_frames = 10;
+    b.max_frames = 5;
+    CHECK_EQ(b.check(&why), RAD_E_INVAL);
+    CHECK(why.find("max_frames") != std::string::npos);
+}
+
 RAD_TEST_MAIN()

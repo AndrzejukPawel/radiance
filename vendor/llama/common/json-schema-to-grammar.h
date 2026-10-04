@@ -26,7 +26,8 @@ class common_schema_info {
 
     void resolve_refs(nlohmann::ordered_json & schema);
     bool resolves_to_string(const nlohmann::ordered_json & schema);
-    // RADIANCE: whether no value satisfies the schema -- `false`, or `{"not": {}}`.
+    // RADIANCE: whether no value satisfies the schema -- `false`, or a `not` of a schema every
+    // value satisfies (`{}`, or types naming all six JSON types).
     bool unsatisfiable(const nlohmann::ordered_json & schema) const;
 };
 

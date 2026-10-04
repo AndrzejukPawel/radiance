@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <string>
 #include <unistd.h>
+#include <cstring>
 #include <vector>
 
 using namespace rad;
@@ -50,6 +51,13 @@ int parse(std::initializer_list<const char*> v, Config* c) {
     std::vector<char*> argv;
     for (std::string& s : store) argv.push_back(s.data());
     return config_parse((int)argv.size(), argv.data(), c);
+}
+
+/* The same into a Config of its own, for a case whose answer depends on flags not carrying over
+ * from an earlier parse. */
+int parse_fresh(std::initializer_list<const char*> v) {
+    Config c;
+    return parse(v, &c);
 }
 
 /* The level `-v` moves and every other test in this binary reads. */
@@ -383,6 +391,243 @@ TEST(the_sampler_defaults_are_range_checked_at_startup) {
     CHECK(d.sample_min_p < 0.0f);
 }
 
+/* A NUMBER IS THE WHOLE ARGUMENT. atof read "high" as 0, which for --temp is greedy decoding. */
+TEST(a_sampler_default_that_is_not_a_number_is_refused) {
+    Config c;
+    CHECK_EQ(parse({ "--temp", "high" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--temp", "0.7x" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--temp", "" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--top-k", "20.5" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--top-p", "inf" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--presence-penalty", "nan" }, &c), RAD_E_INVAL);
+}
+
+/* ================================================================== request defaults and bounds
+ *
+ * NONE OF THEM MOVES ANYTHING UNTIL IT IS GIVEN. Each field's unset value is the one the server
+ * used before the flag existed (or a marker the engine reads as "leave it"), so a command line
+ * that names none of them serves exactly what it served before. */
+TEST(the_request_defaults_and_bounds_are_unset_until_given) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(!d.sample_typical_p && !d.sample_rep_penalty && !d.sample_pres_penalty &&
+          !d.sample_freq_penalty && !d.sample_dry_multiplier && !d.sample_dry_base &&
+          !d.sample_xtc_probability && !d.sample_xtc_threshold);
+    CHECK(!d.sample_penalty_last_n && !d.sample_dry_allowed_length &&
+          !d.sample_dry_penalty_last_n && !d.sample_dry_seq_breakers);
+    CHECK_EQ(d.default_max_tokens, -1ll);
+    CHECK_EQ(d.max_tokens_cap, 0ll);
+    CHECK_EQ(d.max_n, 0ll);
+    CHECK_EQ(d.max_queued_requests, 0ll);
+    CHECK_EQ(d.max_stop_strings, 64ll);
+    CHECK_EQ(d.max_stop_bytes, 4096ll);
+    CHECK(d.chat_template_kwargs.empty());
+    CHECK_EQ(d.reasoning_format, std::string("auto"));
+    /* The transport's own values (server/http.h TransportOptions). */
+    CHECK_EQ(d.http_threads, 0);
+    CHECK_EQ(d.http_read_timeout_s, 30);
+    CHECK_EQ(d.http_write_timeout_s, 600);
+    CHECK_EQ(d.http_keep_alive_timeout_s, 5);
+    CHECK_EQ(d.http_max_body_mib, 512ll);
+    CHECK_EQ(d.retry_after_s, 1);
+    CHECK(d.cors);
+    CHECK(!d.media_flags_set());
+}
+
+TEST(the_request_defaults_reach_their_fields) {
+    Config c;
+    CHECK_EQ(parse({ "--typical-p", "0.9", "--presence-penalty", "1.5",
+                     "--frequency-penalty", "-0.5", "--repetition-penalty", "1.05",
+                     "--repeat-last-n", "-1", "--dry-multiplier", "0.8", "--dry-base", "1.75",
+                     "--dry-allowed-length", "3", "--dry-penalty-last-n", "256",
+                     "--dry-sequence-breakers", R"(["\n", ":"])",
+                     "--xtc-probability", "0.5", "--xtc-threshold", "0.1",
+                     "--default-max-tokens", "4096", "--max-tokens-cap", "8192",
+                     "--max-n", "4", "--max-queued-requests", "64",
+                     "--max-stop-strings", "8", "--max-stop-bytes", "256",
+                     "--reasoning-format", "none" }, &c), RAD_OK);
+    CHECK_NEAR(*c.sample_typical_p, 0.9f, 1e-6);
+    CHECK_NEAR(*c.sample_pres_penalty, 1.5f, 1e-6);
+    CHECK_NEAR(*c.sample_freq_penalty, -0.5f, 1e-6);
+    CHECK_NEAR(*c.sample_rep_penalty, 1.05f, 1e-6);
+    CHECK_EQ(*c.sample_penalty_last_n, -1);
+    CHECK_NEAR(*c.sample_dry_multiplier, 0.8f, 1e-6);
+    CHECK_NEAR(*c.sample_dry_base, 1.75f, 1e-6);
+    CHECK_EQ(*c.sample_dry_allowed_length, 3);
+    CHECK_EQ(*c.sample_dry_penalty_last_n, 256);
+    CHECK(*c.sample_dry_seq_breakers == std::vector<std::string>({ "\n", ":" }));
+    CHECK_NEAR(*c.sample_xtc_probability, 0.5f, 1e-6);
+    CHECK_NEAR(*c.sample_xtc_threshold, 0.1f, 1e-6);
+    CHECK_EQ(c.default_max_tokens, 4096ll);
+    CHECK_EQ(c.max_tokens_cap, 8192ll);
+    CHECK_EQ(c.max_n, 4ll);
+    CHECK_EQ(c.max_queued_requests, 64ll);
+    CHECK_EQ(c.max_stop_strings, 8ll);
+    CHECK_EQ(c.max_stop_bytes, 256ll);
+    CHECK_EQ(c.reasoning_format, std::string("none"));
+
+    /* `auto` is 0, which the server resolves per request to what the context leaves. */
+    Config a;
+    CHECK_EQ(parse({ "--default-max-tokens", "auto" }, &a), RAD_OK);
+    CHECK_EQ(a.default_max_tokens, 0ll);
+
+    /* An empty breaker list is a stated value -- DRY with no breakers -- and stays one. */
+    Config e;
+    CHECK_EQ(parse({ "--dry-sequence-breakers", "[]" }, &e), RAD_OK);
+    CHECK(e.sample_dry_seq_breakers && e.sample_dry_seq_breakers->empty());
+
+    /* A negative penalty is a value a request can send, so the flag can state it. */
+    Config n;
+    CHECK_EQ(parse({ "--presence-penalty", "-2" }, &n), RAD_OK);
+    CHECK_NEAR(*n.sample_pres_penalty, -2.0f, 1e-6);
+}
+
+/* THE RANGES A REQUEST IS HELD TO, at startup: a default outside them would be a 400 on every
+ * request that leaves the field to it. */
+TEST(the_request_defaults_are_range_checked_like_a_request) {
+    Config c;
+    CHECK_EQ(parse({ "--typical-p", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--typical-p", "1.5" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--presence-penalty", "2.5" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--frequency-penalty", "-3" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--repetition-penalty", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--repeat-last-n", "-2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--dry-base", "0.5" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--dry-penalty-last-n", "-2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--xtc-probability", "1.5" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--xtc-threshold", "-0.1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--dry-allowed-length", "3.5" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--dry-sequence-breakers", R"("\n")" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--dry-sequence-breakers", "[1]" }, &c), RAD_E_INVAL);
+    /* The sampler takes at most 16 (sample/host_ref.h); every DRY request would be refused. */
+    CHECK_EQ(parse({ "--dry-sequence-breakers",
+                     R"(["a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q"])" },
+                   &c), RAD_E_INVAL);
+
+    CHECK_EQ(parse({ "--default-max-tokens", "0" }, &c), RAD_E_INVAL);   /* auto is the word */
+    CHECK_EQ(parse({ "--default-max-tokens", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--default-max-tokens", "AUTO" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--default-max-tokens", "4294967296" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--max-tokens-cap", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--max-n", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--max-queued-requests", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--max-stop-strings", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--max-stop-bytes", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--reasoning-format", "deepseek" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--reasoning-format", "" }, &c), RAD_E_INVAL);
+}
+
+/* BOUNDS THAT CONTRADICT EACH OTHER. A default above the cap is a default no request is served
+ * at; an `n` above the queue is a request that is 429 however long its caller waits. */
+TEST(request_bounds_that_contradict_each_other_are_refused) {
+    CHECK_EQ(parse_fresh({ "--default-max-tokens", "4096", "--max-tokens-cap", "1024" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--default-max-tokens", "1024", "--max-tokens-cap", "1024" }), RAD_OK);
+    CHECK_EQ(parse_fresh({ "--default-max-tokens", "auto", "--max-tokens-cap", "1024" }), RAD_OK);
+
+    CHECK_EQ(parse_fresh({ "--max-n", "65", "--max-queued-requests", "64" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--max-n", "64", "--max-queued-requests", "64" }), RAD_OK);
+    /* The queue's default is 8 x --max-num-seqs, and the check reads it. */
+    CHECK_EQ(parse_fresh({ "--max-num-seqs", "2", "--max-n", "17" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--max-num-seqs", "2", "--max-n", "16" }), RAD_OK);
+    /* And a stated queue smaller than the default n (8, or --max-num-seqs). */
+    CHECK_EQ(parse_fresh({ "--max-queued-requests", "4" }), RAD_E_INVAL);
+}
+
+TEST(the_template_variables_merge_key_by_key_and_later_wins) {
+    Config c;
+    CHECK_EQ(parse({ "--chat-template-kwargs", R"({"enable_thinking": false, "custom": "a"})",
+                     "--chat-template-kwargs", R"({"custom": "b", "n": 3})" }, &c), RAD_OK);
+    CHECK_EQ(c.chat_template_kwargs.size(), 3u);
+    CHECK_EQ(c.chat_template_kwargs["enable_thinking"], std::string("false"));
+    CHECK_EQ(c.chat_template_kwargs["custom"], std::string("\"b\""));   /* JSON text, quoted */
+    CHECK_EQ(c.chat_template_kwargs["n"], std::string("3"));
+
+    /* @FILE reads the object from a file. */
+    char path[] = "/tmp/rad_kwargs_XXXXXX";
+    const int fd = mkstemp(path);
+    REQUIRE(fd >= 0);
+    const std::string body = R"({"date_string": "01 Jan 2026"})";
+    CHECK_EQ((size_t)write(fd, body.data(), body.size()), body.size());
+    close(fd);
+    Config f;
+    const std::string at = std::string("@") + path;
+    CHECK_EQ(parse({ "--chat-template-kwargs", at.c_str() }, &f), RAD_OK);
+    CHECK_EQ(f.chat_template_kwargs["date_string"], std::string("\"01 Jan 2026\""));
+    unlink(path);
+    CHECK_EQ(parse({ "--chat-template-kwargs", at.c_str() }, &f), RAD_E_INVAL);   /* gone */
+}
+
+TEST(a_template_variable_the_server_owns_or_cannot_read_is_refused) {
+    CHECK_EQ(parse_fresh({ "--chat-template-kwargs", "[1]" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--chat-template-kwargs", "{nope" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--chat-template-kwargs", R"("enable_thinking")" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--chat-template-kwargs", R"({"enable_thinking": "no"})" }), RAD_E_INVAL);
+    /* The renderer writes these over the context; one here would replace every conversation. */
+    for (const char* k : { "messages", "tools", "bos_token", "eos_token", "add_generation_prompt" }) {
+        const std::string j = std::string("{\"") + k + "\": 1}";
+        CHECK_EQ(parse_fresh({ "--chat-template-kwargs", j.c_str() }), RAD_E_INVAL);
+    }
+    /* Two defaults for thinking, in two flags, with no order between them. */
+    CHECK_EQ(parse_fresh({ "--reasoning-effort", "low",
+                           "--chat-template-kwargs", R"({"reasoning_effort": "high"})" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--chat-template-kwargs", R"({"enable_thinking": true})",
+                           "--reasoning-effort", "none" }), RAD_E_INVAL);
+    CHECK_EQ(parse_fresh({ "--reasoning-effort", "low",
+                           "--chat-template-kwargs", R"({"custom": 1})" }), RAD_OK);
+}
+
+TEST(the_transport_flags_reach_their_fields_and_hold_their_floors) {
+    Config c;
+    CHECK_EQ(parse({ "--http-threads", "16", "--read-timeout", "10", "--write-timeout", "120",
+                     "--keep-alive-timeout", "30", "--max-body-mib", "64", "--retry-after", "5",
+                     "--no-cors" }, &c), RAD_OK);
+    CHECK_EQ(c.http_threads, 16);
+    CHECK_EQ(c.http_read_timeout_s, 10);
+    CHECK_EQ(c.http_write_timeout_s, 120);
+    CHECK_EQ(c.http_keep_alive_timeout_s, 30);
+    CHECK_EQ(c.http_max_body_mib, 64ll);
+    CHECK_EQ(c.retry_after_s, 5);
+    CHECK(!c.cors);
+
+    /* The transport keeps four workers whatever it is told, so fewer is refused, not ignored. */
+    CHECK_EQ(parse({ "--http-threads", "2" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--read-timeout", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--write-timeout", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--keep-alive-timeout", "x" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--max-body-mib", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--retry-after", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--retry-after", "0" }, &c), RAD_OK);
+}
+
+TEST(the_media_flags_reach_their_fields_and_refuse_an_empty_band) {
+    Config c;
+    CHECK_EQ(parse({ "--image-min-pixels", "3136", "--image-max-pixels", "1003520",
+                     "--video-min-pixels", "4096", "--video-max-pixels", "8388608",
+                     "--video-fps", "1.5", "--video-min-frames", "2", "--video-max-frames", "64",
+                     "--video-max-frame-tokens", "0", "--max-source-pixels", "16777216" }, &c),
+             RAD_OK);
+    CHECK(c.media_flags_set());
+    CHECK_EQ(*c.image_min_pixels, 3136ll);
+    CHECK_EQ(*c.image_max_pixels, 1003520ll);
+    CHECK_EQ(*c.video_min_pixels, 4096ll);
+    CHECK_EQ(*c.video_max_pixels, 8388608ll);
+    CHECK_NEAR(*c.video_fps, 1.5, 1e-9);
+    CHECK_EQ(*c.video_min_frames, 2);
+    CHECK_EQ(*c.video_max_frames, 64);
+    CHECK_EQ(*c.video_max_frame_tokens, 0);      /* 0 is "no per-frame cap" */
+    CHECK_EQ(*c.max_source_pixels, 16777216ll);
+
+    CHECK_EQ(parse({ "--image-min-pixels", "2000", "--image-max-pixels", "1000" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--video-min-pixels", "2000", "--video-max-pixels", "1000" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--video-min-frames", "8", "--video-max-frames", "4" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--image-max-pixels", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--video-fps", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--video-fps", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--video-min-frames", "0" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--video-max-frame-tokens", "-1" }, &c), RAD_E_INVAL);
+    CHECK_EQ(parse({ "--max-source-pixels", "0" }, &c), RAD_E_INVAL);
+}
+
 /* REFUSED, NOT QUIETLY IGNORED. Accepting it and then serving the container's own drafter -- or
  * none -- hands the caller a server that is not the one they asked for, with nothing in the
  * output to say so. A caller coming from vLLM will reach for this flag. */
@@ -537,6 +782,12 @@ TEST(usage_names_every_flag_it_documents) {
     CHECK(text.find("--tp-wire") != std::string::npos);
     CHECK(text.find("--kld-record") != std::string::npos);
     CHECK(text.find("--kld-ref") != std::string::npos);
+    for (const char* f : { "--default-max-tokens", "--max-tokens-cap", "--presence-penalty",
+                           "--dry-sequence-breakers", "--chat-template-kwargs",
+                           "--reasoning-format", "--max-n", "--max-queued-requests",
+                           "--max-stop-strings", "--http-threads", "--max-body-mib", "--no-cors",
+                           "--image-max-pixels", "--video-fps", "--max-source-pixels" })
+        CHECK(text.find(f) != std::string::npos);
     CHECK(text.size() > 1000);
 }
 

@@ -900,10 +900,6 @@ public:
         visit_refs(schema);
     }
 
-    // RADIANCE: the schema no value satisfies. JSON Schema spells it `false`, and `{"not": {}}` --
-    // which is how TypeBox's Type.Never and Arktype's "never" are exported, the latter as an
-    // optional property no call may set. A `not` of the empty schema makes its whole schema
-    // unsatisfiable whatever sits beside it, so the sibling keywords do not matter.
     // RADIANCE: a count -- minLength, maxLength, minItems, maxItems -- as the int build_repetition
     // takes, or `dflt` where the schema has none. get<int>() casts, so a bound past INT_MAX wrapped:
     // Number.MAX_SAFE_INTEGER, a common way to write "no limit", came out as -1 and the grammar did
@@ -924,11 +920,74 @@ public:
         return d >= (double) std::numeric_limits<int>::max() ? std::numeric_limits<int>::max() : (int) d;
     }
 
+    // RADIANCE: the schema every value satisfies, whose `not` is therefore the schema none does.
+    // `{}` and `true` are it, and so is a type list, or a union of bare types, that between them
+    // name all six JSON types -- the way Arktype exports the complement of `never` for an optional
+    // property: {"not": {"anyOf": [{"type": "string"}, {"type": "number"}, {"type": "boolean"},
+    // {"type": "object"}, {"type": "array"}, {"type": "null"}]}}. Annotations may sit beside; any
+    // other keyword narrows the schema, and its `not` is a real complement, refused below. A union
+    // alternative that constrains more than its type is not counted, so a union is only ever read
+    // as universal when it is.
+    static bool is_universal(const json & s) {
+        if (s.is_boolean()) return s.get<bool>();
+        if (!s.is_object()) return false;
+        static const std::unordered_set<std::string> annotations = {
+            "description", "title", "default", "examples", "$comment", "deprecated", "readOnly",
+            "writeOnly",
+        };
+        // Whether every key of `o` is an annotation or `allowed`.
+        auto only = [&](const json & o, const char * allowed) {
+            for (auto it = o.begin(); it != o.end(); ++it) {
+                if (annotations.count(it.key()) == 0 && (allowed == nullptr || it.key() != allowed)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        // The types a bare `type` names, into `out`; false for anything that is not one.
+        auto types_of = [](const json & t, std::unordered_set<std::string> & out) {
+            if (t.is_string()) {
+                out.insert(t.get<std::string>());
+                return true;
+            }
+            if (!t.is_array()) return false;
+            for (const auto & e : t) {
+                if (!e.is_string()) return false;
+                out.insert(e.get<std::string>());
+            }
+            return true;
+        };
+        auto covers = [](const std::unordered_set<std::string> & ts) {
+            for (const char * t : { "string", "number", "boolean", "object", "array", "null" }) {
+                if (ts.count(t) == 0) return false;
+            }
+            return true;
+        };
+        if (only(s, nullptr)) return true;
+        std::unordered_set<std::string> ts;
+        if (s.contains("type") && only(s, "type")) {
+            return types_of(s["type"], ts) && covers(ts);
+        }
+        if (s.contains("anyOf") && only(s, "anyOf") && s["anyOf"].is_array()) {
+            for (const auto & a : s["anyOf"]) {
+                if (is_universal(a)) return true;
+                if (a.is_object() && a.contains("type") && only(a, "type")) {
+                    types_of(a["type"], ts);
+                }
+            }
+            return covers(ts);
+        }
+        return false;
+    }
+
+    // RADIANCE: the schema no value satisfies. JSON Schema spells it `false`, and TypeBox's
+    // Type.Never and Arktype's "never" export it as a `not` of the universal schema above, the
+    // latter for an optional property no call may set. Such a `not` makes its whole schema
+    // unsatisfiable whatever sits beside it, so the sibling keywords do not matter.
     static bool is_unsatisfiable(const json & schema) {
         if (schema.is_boolean()) return !schema.get<bool>();
         if (!schema.is_object() || !schema.contains("not")) return false;
-        const json & n = schema["not"];
-        return (n.is_object() && n.empty()) || (n.is_boolean() && n.get<bool>());
+        return is_universal(schema["not"]);
     }
 
     static std::string _generate_constant_rule(const json & value) {

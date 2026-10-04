@@ -850,6 +850,88 @@ TEST(gbnf_a_property_no_value_satisfies_is_a_key_never_written) {
     CHECK(built >= 3);
 }
 
+/* THE `not` OF A SCHEMA EVERY VALUE SATISFIES is `never` too, whatever spelling the universal
+ * schema takes. oh-my-pi 18.6.0 sends its `task` tool's optional `model` as the `not` of a union
+ * of all six JSON types, not as `{"not": {}}`; refused, it failed the tool-call grammar of every
+ * request carrying the tool under every template that constrains arguments. A `not` of anything
+ * narrower is a real complement and stays refused. */
+TEST(gbnf_a_not_of_every_json_type_is_never_too) {
+    auto bv = bpe_like(29, 1500);
+    auto whole = [&](const std::string& gbnf, const std::string& text) {
+        std::unique_ptr<GbnfGrammar> g;
+        std::string err;
+        if (GbnfGrammar::create(gbnf, "root", &bv->v, false, {}, {}, &g, &err) < 0) return false;
+        return g->accept_str(text) >= 0 && g->complete();
+    };
+    auto optional_model = [](const std::string& never) {
+        return std::string(R"({"type":"object","properties":{"context":{"type":"string"},"model":)") +
+               never + R"(},"required":["context"]})";
+    };
+
+    for (const char* never : {
+             R"({"not":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},)"
+             R"({"type":"object"},{"type":"array"},{"type":"null"}]}})",
+             R"({"not":{"type":["string","number","boolean","object","array","null"]}})",
+             R"({"not":{"anyOf":[{"type":["string","number"]},{"type":["boolean","object"]},)"
+             R"({"type":"array","description":"a list"},{"type":"null"}]}})",
+             R"({"not":{"anyOf":[{"type":"string","minLength":1},{}]}})",
+             R"({"not":true})",
+             R"({"not":{"description":"anything"}})" }) {
+        std::string gbnf, err;
+        CHECK_OK(grammar_from_json_schema(optional_model(never), "root", &gbnf, &err));
+        CHECK(whole(gbnf, "{\"context\": \"x\"}"));
+        CHECK(!whole(gbnf, "{\"context\": \"x\", \"model\": \"y\"}"));
+        CHECK(!whole(gbnf, "{\"context\": \"x\", \"model\": null}"));
+    }
+
+    for (const char* complement : {
+             /* no null among the six */
+             R"({"not":{"anyOf":[{"type":"string"},{"type":"number"},{"type":"boolean"},)"
+             R"({"type":"object"},{"type":"array"}]}})",
+             /* integer is not number */
+             R"({"not":{"type":["string","integer","boolean","object","array","null"]}})",
+             /* an alternative that constrains more than its type is not all of that type */
+             R"({"not":{"anyOf":[{"type":"string","minLength":1},{"type":"number"},)"
+             R"({"type":"boolean"},{"type":"object"},{"type":"array"},{"type":"null"}]}})",
+             /* a keyword beside the type narrows it */
+             R"({"not":{"type":["string","number","boolean","object","array","null"],"minimum":0}})",
+             R"({"not":{"type":"string"}})" }) {
+        std::string gbnf, err;
+        CHECK(grammar_from_json_schema(optional_model(complement), "root", &gbnf, &err) < 0);
+        CHECK(err.find("not") != std::string::npos);
+    }
+}
+
+/* OH-MY-PI 18.6.0's TOOLS AS IT SENDS THEM, captured from an unmodified client and kept whole but
+ * for their descriptions (tests/data/chat/oh-my-pi-18.6.0-tools.json). Every served template must
+ * render them and every grammar it writes must compile, which is what admission does with it. */
+TEST(gbnf_oh_my_pi_tools_build_and_compile_under_every_template) {
+    auto bv = bpe_like(31, 3000);
+    const ojson tools = ojson::parse(slurp(fixture("../chat/oh-my-pi-18.6.0-tools.json")));
+    REQUIRE(tools.is_array() && tools.size() == 11);
+    const ojson messages = ojson::array({ ojson{ { "role", "user" }, { "content", "hi" } } });
+    int built = 0;
+    for (const TemplateCase& tc : kTemplates) {
+        ChatTemplate ct;
+        REQUIRE(ct.load(slurp(fixture(tc.file)), tc.bos, tc.eos) >= 0);
+        for (int par = 0; par < 2; ++par) {
+            ChatOptions opt;
+            opt.tool_choice = "auto";
+            opt.parallel_tool_calls = par != 0;
+            opt.template_kwargs["preserve_thinking"] = "true";
+            ChatPrompt cp;
+            CHECK(ct.apply(messages, tools, opt, &cp) >= 0);
+            if (cp.grammar.empty()) continue;
+            ++built;
+            std::unique_ptr<GbnfGrammar> g;
+            std::string err;
+            CHECK(GbnfGrammar::create(cp.grammar, "root", &bv->v, false, {}, {}, &g, &err) >= 0);
+            if (!err.empty()) fprintf(stderr, "    %s: %s\n", tc.file, err.c_str());
+        }
+    }
+    CHECK(built >= 2);
+}
+
 /* The grammars a chat template writes for its own tool-call syntax, from the three templates the
  * engine serves: walked, and replayed over four agent calls wherever the syntax is the one the
  * calls are written in. */

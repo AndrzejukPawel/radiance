@@ -1742,6 +1742,22 @@ SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool containe
     if (cfg.sample_min_p >= 0.0f) { sp.min_p = cfg.sample_min_p; over += " --min-p"; }
     if (cfg.sample_top_k >= 0)    { sp.top_k = cfg.sample_top_k; over += " --top-k"; }
 
+    /* THE REST OF THE SAMPLER HAS NO FILE SOURCE: a generation_config.json is read for the four
+     * fields above and no others, so these are SamplingParams' own values unless a flag sets
+     * them, and request_overrides() logs the ones that did. */
+    if (cfg.sample_typical_p)          sp.typical_p          = *cfg.sample_typical_p;
+    if (cfg.sample_rep_penalty)        sp.rep_penalty        = *cfg.sample_rep_penalty;
+    if (cfg.sample_pres_penalty)       sp.pres_penalty       = *cfg.sample_pres_penalty;
+    if (cfg.sample_freq_penalty)       sp.freq_penalty       = *cfg.sample_freq_penalty;
+    if (cfg.sample_penalty_last_n)     sp.penalty_last_n     = *cfg.sample_penalty_last_n;
+    if (cfg.sample_dry_multiplier)     sp.dry_multiplier     = *cfg.sample_dry_multiplier;
+    if (cfg.sample_dry_base)           sp.dry_base           = *cfg.sample_dry_base;
+    if (cfg.sample_dry_allowed_length) sp.dry_allowed_length = *cfg.sample_dry_allowed_length;
+    if (cfg.sample_dry_penalty_last_n) sp.dry_penalty_last_n = *cfg.sample_dry_penalty_last_n;
+    if (cfg.sample_dry_seq_breakers)   sp.dry_seq_breakers   = *cfg.sample_dry_seq_breakers;
+    if (cfg.sample_xtc_probability)    sp.xtc_probability    = *cfg.sample_xtc_probability;
+    if (cfg.sample_xtc_threshold)      sp.xtc_threshold      = *cfg.sample_xtc_threshold;
+
     const std::string from = src.empty() ? (over.empty() ? "nothing stated it" : "the command line")
                                          : src;
     RAD_INFO("sampling defaults for requests that send none: %s (from %s%s%s)",
@@ -1754,6 +1770,45 @@ SamplingParams resolve_sampling_defaults(const RadModelMeta& meta, bool containe
                  "--generation-config, or put the checkpoint's generation_config.json beside the "
                  "container as %s.", gen_sidecar_path(cfg.model).c_str());
     return sp;
+}
+
+/* "presence_penalty 1.5, max_tokens auto, ..." -- every request default and bound the command line
+ * moved, under the request's spelling of the field, or "" when it moved none. The four fields
+ * resolve_sampling_defaults describes are not repeated. */
+std::string request_overrides(const Config& c) {
+    std::string out;
+    auto add = [&out](const std::string& s) { out += (out.empty() ? "" : ", ") + s; };
+    char b[64];
+    auto f = [&](const char* k, const std::optional<float>& v) {
+        if (v) { snprintf(b, sizeof b, "%s %g", k, (double)*v); add(b); }
+    };
+    auto i = [&](const char* k, const std::optional<int>& v) {
+        if (v) add(std::string(k) + " " + std::to_string(*v));
+    };
+    f("typical_p", c.sample_typical_p);
+    f("presence_penalty", c.sample_pres_penalty);
+    f("frequency_penalty", c.sample_freq_penalty);
+    f("repetition_penalty", c.sample_rep_penalty);
+    i("repeat_last_n", c.sample_penalty_last_n);
+    f("dry_multiplier", c.sample_dry_multiplier);
+    f("dry_base", c.sample_dry_base);
+    i("dry_allowed_length", c.sample_dry_allowed_length);
+    i("dry_penalty_last_n", c.sample_dry_penalty_last_n);
+    if (c.sample_dry_seq_breakers)
+        add("dry_sequence_breakers " + std::to_string(c.sample_dry_seq_breakers->size()) +
+            " strings");
+    f("xtc_probability", c.sample_xtc_probability);
+    f("xtc_threshold", c.sample_xtc_threshold);
+    if (c.default_max_tokens == 0) add("max_tokens auto");
+    else if (c.default_max_tokens > 0) add("max_tokens " + std::to_string(c.default_max_tokens));
+    if (c.max_tokens_cap > 0) add("max_tokens capped at " + std::to_string(c.max_tokens_cap));
+    if (c.max_n > 0) add("n up to " + std::to_string(c.max_n));
+    if (c.max_stop_strings != 64 || c.max_stop_bytes != 4096)
+        add("stop up to " + std::to_string(c.max_stop_strings) + " strings of " +
+            std::to_string(c.max_stop_bytes) + " bytes");
+    for (const auto& [k, v] : c.chat_template_kwargs) add("template " + k + "=" + v);
+    if (c.reasoning_format != "auto") add("reasoning_format " + c.reasoning_format);
+    return out;
 }
 }  /* namespace */
 int Engine::run_server() {
@@ -1967,10 +2022,37 @@ int Engine::run_server() {
     o.max_seqs = cfg_.max_seqs;
     /* `n` fans one request out over the batch, so a server that runs more sequences a step takes
      * more choices a request; the floor keeps a small batch from refusing what it would queue. */
-    o.max_n    = (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
+    o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.default_sampling = resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
+    o.default_dry_breakers_set = cfg_.sample_dry_seq_breakers.has_value();
+    /* -1 leaves ServerOptions' own default. `auto` (0) is resolved per request against the
+     * context, so it needs one to resolve against. */
+    if (cfg_.default_max_tokens >= 0) o.default_max_tokens = cfg_.default_max_tokens;
+    if (o.default_max_tokens == 0 && o.max_ctx <= 0) {
+        RAD_ERR("--default-max-tokens auto is what the context leaves, and this model states no "
+                "context; pass --max-model-len");
+        return RAD_E_INVAL;
+    }
+    o.max_tokens_cap  = cfg_.max_tokens_cap;
+    o.queue_depth     = cfg_.max_queued_requests;      /* 0: the server's 8 x max_seqs */
+    o.max_stops       = cfg_.max_stop_strings;
+    o.max_stop_bytes  = cfg_.max_stop_bytes;
+    o.default_template_kwargs = cfg_.chat_template_kwargs;
+    o.reasoning_format = cfg_.reasoning_format;
+    o.n_threads       = cfg_.http_threads;
+    o.read_timeout_s  = cfg_.http_read_timeout_s;
+    o.write_timeout_s = cfg_.http_write_timeout_s;
+    o.keep_alive_timeout_s = cfg_.http_keep_alive_timeout_s;
+    o.max_body_bytes  = (size_t)cfg_.http_max_body_mib << 20;
+    o.retry_after_s   = cfg_.retry_after_s;
+    o.cors            = cfg_.cors;
+    {
+        const std::string moved = request_overrides(cfg_);
+        if (!moved.empty()) RAD_INFO("request defaults and bounds from the command line: %s",
+                                     moved.c_str());
+    }
     o.engine_info = engine_info();
     /* Per request, not once: the dump carries OpInfo::issued, which only becomes true once the
      * run phase has run. See ServerOptions::graph_json. */
@@ -1991,6 +2073,30 @@ int Engine::run_server() {
             return RAD_E_INVAL;
         }
         vc.max_patches = encd.max_patches;
+        /* THE COMMAND LINE OVER THE CONTAINER, field by field, and the result checked as a whole:
+         * a minimum stated alone can land above the maximum the container states. */
+        if (cfg_.image_min_pixels)       vc.image_min_pixels  = *cfg_.image_min_pixels;
+        if (cfg_.image_max_pixels)       vc.image_max_pixels  = *cfg_.image_max_pixels;
+        if (cfg_.video_min_pixels)       vc.video_min_pixels  = *cfg_.video_min_pixels;
+        if (cfg_.video_max_pixels)       vc.video_max_pixels  = *cfg_.video_max_pixels;
+        if (cfg_.video_fps)              vc.fps               = *cfg_.video_fps;
+        if (cfg_.video_min_frames)       vc.min_frames        = *cfg_.video_min_frames;
+        if (cfg_.video_max_frames)       vc.max_frames        = *cfg_.video_max_frames;
+        if (cfg_.video_max_frame_tokens) vc.max_frame_rows    = *cfg_.video_max_frame_tokens;
+        if (cfg_.max_source_pixels)      vc.max_source_pixels = *cfg_.max_source_pixels;
+        if (cfg_.media_flags_set() && vc.check(&why) < 0) {
+            RAD_ERR("media: the media flags and what the container states disagree: %s",
+                    why.c_str());
+            return RAD_E_INVAL;
+        }
+        /* The processor lowers the image band to one encoder pass; an operator who asked for
+         * more is told, rather than finding the cap in the startup line below. */
+        const int64_t pass_px = encd.max_patches * vc.patch * vc.patch;
+        if (cfg_.image_max_pixels && *cfg_.image_max_pixels > pass_px)
+            RAD_WARN("media: --image-max-pixels %lld is above what one encoder pass takes (%lld "
+                     "pixels at --mm-max-patches %lld); images are resized to at most that",
+                     (long long)*cfg_.image_max_pixels, (long long)pass_px,
+                     (long long)encd.max_patches);
         if (vc.patch_dim() != encd.patch_dim || (int64_t)vc.merge * vc.merge != encd.merge) {
             RAD_ERR("the container's processor cuts %lld-element patches merged %lld to a row; the "
                     "'%s' encoder takes %lld-element patches merged %lld", (long long)vc.patch_dim(),
@@ -2019,7 +2125,30 @@ int Engine::run_server() {
                      (long long)mm_proc->config().video_max_pixels);
     }
 
+    if (encd.modalities == 0 && cfg_.media_flags_set())
+        RAD_WARN("media: the media flags do nothing here -- this model %s",
+                 cfg_.mm_max_patches == 0 ? "is served text only (--mm-max-patches 0)"
+                                          : "takes no images or video");
+
     server::Server srv(d, o);
+
+    /* A TEMPLATE DEFAULT THE TEMPLATE REFUSES is a 400 on every chat request that leaves it to
+     * the default, found by the first caller rather than the operator. --chat-template-kwargs
+     * stops startup; --reasoning-effort only warns, because a deployment whose clients all send
+     * their own effort serves correctly with one the template would refuse. */
+    if (d.chat && (!cfg_.chat_template_kwargs.empty() || !cfg_.reasoning_effort.empty())) {
+        std::string kw_why, eff_why;
+        srv.check_template_defaults(&kw_why, &eff_why);
+        if (!kw_why.empty()) {
+            RAD_ERR("--chat-template-kwargs: the chat template refuses a request carrying them: %s",
+                    kw_why.c_str());
+            return RAD_E_INVAL;
+        }
+        if (!eff_why.empty())
+            RAD_WARN("--reasoning-effort %s: the chat template refuses it, so every chat request "
+                     "that sends no reasoning effort of its own will be answered 400: %s",
+                     cfg_.reasoning_effort.c_str(), eff_why.c_str());
+    }
     RAD_INFO("serving on http://%s:%d  (/v1/completions%s)%s", o.host.c_str(), o.port,
              d.chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",
              o.api_key.empty() ? "" : "  -- a bearer key is required");
