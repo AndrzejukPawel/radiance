@@ -933,6 +933,13 @@ accepts no value — `false`, or `{"not": {}}`, which is how TypeBox and Arktype
 an argument no call writes. Any other `not` is refused with a 400 naming it: the grammar cannot
 express a complement, and dropping the constraint silently would serve a call the tool forbids.
 
+Length bounds are held exactly: `maxLength`, `minLength`, `maxItems` and `minItems` up to about
+200,000, which costs the first request carrying the tool under a second to compile on a
+quarter-million-token vocabulary and nothing per token after that. A bound past 2^31 (as
+`Number.MAX_SAFE_INTEGER` is) is no bound, since no context holds that much. One in between is
+refused with a 400 naming the property's rule and the count. The same holds for `response_format`
+schemas and `{m,n}` in a GBNF grammar.
+
 ### 5.5 Constrained output
 
 ```sh

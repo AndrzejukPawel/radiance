@@ -1063,6 +1063,160 @@ TEST(gbnf_a_repetition_longer_than_any_token_costs_what_the_token_does) {
     CHECK_EQ(t.mismatches, 0);
 }
 
+/* A LENGTH BOUND PAST 2000 IS HELD, EXACTLY. Upstream refused any repetition count past 2000, so
+ * a tool whose string argument declared `maxLength: 8000` failed every request carrying it. The
+ * expansion is bounded by what it costs to compile, not by the count: the bound is the string's
+ * length to the character, the plan is the one a count under 2000 compiles to, and only a count
+ * the compile budget cannot hold is refused -- naming the rule it is in. */
+TEST(gbnf_a_length_bound_past_two_thousand_is_held_exactly) {
+    auto bv = bpe_like(59, 1500);
+    auto whole = [&](const std::string& gbnf, const std::string& text) {
+        std::unique_ptr<GbnfGrammar> g;
+        std::string err;
+        if (GbnfGrammar::create(gbnf, "root", &bv->v, false, {}, {}, &g, &err) < 0) return false;
+        return g->accept_str(text) >= 0 && g->complete();
+    };
+    auto from_schema = [](const std::string& schema) {
+        std::string gbnf, err;
+        CHECK_OK(grammar_from_json_schema(schema, "root", &gbnf, &err));
+        return gbnf;
+    };
+    auto quoted = [](size_t n) { return "\"" + std::string(n, 'a') + "\""; };
+
+    for (int n : { 2001, 8000, 65536 }) {
+        const std::string g =
+            from_schema("{\"type\":\"string\",\"maxLength\":" + std::to_string(n) + "}");
+        CHECK(whole(g, quoted(0)));
+        CHECK(whole(g, quoted((size_t)n)));
+        CHECK(!whole(g, quoted((size_t)n + 1)));
+    }
+    {
+        const std::string g = from_schema(R"({"type":"string","minLength":3000,"maxLength":8000})");
+        CHECK(!whole(g, quoted(2999)));
+        CHECK(whole(g, quoted(3000)));
+        CHECK(whole(g, quoted(8000)));
+        CHECK(!whole(g, quoted(8001)));
+    }
+    {
+        const std::string g =
+            from_schema(R"({"type":"array","items":{"type":"integer"},"maxItems":5000})");
+        auto ones = [](int k) {
+            std::string s = "[";
+            for (int i = 0; i < k; ++i) s += i ? ",1" : "1";
+            return s + "]";
+        };
+        CHECK(whole(g, ones(5000)));
+        CHECK(!whole(g, ones(5001)));
+    }
+
+    /* The plan does not grow with the bound: past the longest token, no token tells the counts
+     * apart. */
+    std::vector<GbnfProgramInfo> info;
+    for (int n : { 1999, 8000, 65536 }) {
+        std::shared_ptr<const GbnfProgram> p;
+        std::string err;
+        REQUIRE(gbnf_compile(from_schema("{\"type\":\"string\",\"maxLength\":" +
+                                         std::to_string(n) + "}"),
+                             "root", &bv->v, &p, &err) >= 0);
+        info.push_back(gbnf_program_info(*p));
+    }
+    CHECK_EQ(info[0].keys, info[1].keys);
+    CHECK_EQ(info[1].keys, info[2].keys);
+    CHECK_EQ(info[0].dense_masks, info[2].dense_masks);
+
+    /* The tool from the report, four 8000-character fields, through every served template's
+     * tool-call grammar and compiled: the request it is in is served. */
+    const char* tools = R"([{"type":"function","function":{"name":"clarify",
+      "description":"Ask the user to choose.","parameters":{"type":"object","properties":{
+       "question":{"type":"string","maxLength":8000},
+       "choices":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":8000}}},
+       "required":["question","choices"]}}}])";
+    const ojson messages = ojson::array({ ojson{ { "role", "user" }, { "content", "hi" } } });
+    int compiled = 0, carried = 0;
+    for (const TemplateCase& tc : kTemplates) {
+        ChatTemplate ct;
+        REQUIRE(ct.load(slurp(fixture(tc.file)), tc.bos, tc.eos) >= 0);
+        for (int par = 0; par < 2; ++par) {
+            for (const char* choice : { "auto", "required" }) {
+                ChatOptions opt;
+                opt.tool_choice = choice;
+                opt.parallel_tool_calls = par != 0;
+                ChatPrompt cp;
+                CHECK(ct.apply(messages, ojson::parse(tools), opt, &cp) >= 0);
+                if (cp.grammar.empty()) continue;
+                std::shared_ptr<const GbnfProgram> p;
+                std::string err;
+                const auto t0 = std::chrono::steady_clock::now();
+                CHECK(gbnf_compile(cp.grammar, "root", &bv->v, &p, &err) >= 0);
+                if (!err.empty()) std::fprintf(stderr, "    %s: %s\n", tc.file, err.c_str());
+                const double ms = ms_since(t0);
+                CHECK(ms < 2000.0);
+                ++compiled;
+                if (cp.grammar.find("8000}") != std::string::npos) {
+                    ++carried;
+                    std::fprintf(stderr, "    %s, %s, parallel %s: the bound is in the grammar\n",
+                                 tc.file, choice, par ? "on" : "off");
+                }
+            }
+        }
+    }
+    CHECK(compiled >= 6);
+    CHECK(carried >= 1);
+
+    /* A group under a repetition is a reference to the group's rule, not a copy of it, so its
+     * cost is the two counts added, not multiplied; upstream refused it as multiplied. */
+    {
+        std::shared_ptr<const GbnfProgram> p;
+        std::string err;
+        CHECK(gbnf_compile("root ::= ([a-z]{3000}){3000} \";\"\n", "root", &bv->v, &p, &err) >= 0);
+    }
+
+    /* A schema's bound past INT_MAX -- Number.MAX_SAFE_INTEGER is a common "no limit" -- is no
+     * bound, which no context the engine serves can tell from the bound; it used to wrap to -1 and
+     * fail to parse. A negative or non-numeric bound is refused by the converter, naming it. */
+    for (const char* big : { "9007199254740991", "1e300", "2147483648" }) {
+        const std::string g =
+            from_schema(std::string("{\"type\":\"string\",\"maxLength\":") + big + "}");
+        CHECK(whole(g, quoted(3000)));
+        const std::string a = from_schema(std::string("{\"type\":\"array\",\"maxItems\":") + big +
+                                          ",\"items\":{\"type\":\"integer\"}}");
+        CHECK(whole(a, "[1,2,3]"));
+    }
+    for (const char* bad : { R"({"type":"string","maxLength":-5})",
+                             R"({"type":"string","minLength":"3"})",
+                             R"({"type":"array","items":{},"maxItems":-1})" }) {
+        std::string gbnf, err;
+        CHECK(grammar_from_json_schema(bad, "root", &gbnf, &err) < 0);
+        CHECK(err.find("must be a non-negative number") != std::string::npos);
+    }
+
+    /* A bound the compile budget cannot hold is refused naming the property's rule and the
+     * count, which is what a client needs to find it in its tool list. */
+    {
+        std::shared_ptr<const GbnfProgram> p;
+        std::string err;
+        CHECK(gbnf_compile(from_schema(R"({"type":"object","properties":{"content":)"
+                                       R"({"type":"string","maxLength":1000000}}})"),
+                           "root", &bv->v, &p, &err) < 0);
+        CHECK(err.find("rule 'content'") != std::string::npos);
+        CHECK(err.find("{0,1000000}") != std::string::npos);
+    }
+
+    /* What the budget cannot hold is refused, by rule, and a count past 2^64 - 2 is refused as
+     * one; none of them wraps into a small expansion that compiles. A repetition of a repetition
+     * copies the expanded run, so `{3000}{3000}` is nine million elements. */
+    for (const char* g : { "root ::= \"a\" item\nitem ::= [a-z]{0,100000000}\n",
+                           "root ::= \"a\" item\nitem ::= [a-z]{0,18446744073709551614}\n",
+                           "root ::= \"a\" item\nitem ::= [a-z]{18446744073709551614}\n",
+                           "root ::= \"a\" item\nitem ::= [a-z]{0,99999999999999999999999}\n",
+                           "root ::= \"a\" item\nitem ::= [a-z]{3000}{3000}\n" }) {
+        std::shared_ptr<const GbnfProgram> p;
+        std::string err;
+        CHECK(gbnf_compile(g, "root", &bv->v, &p, &err) < 0);
+        CHECK(err.find("rule 'item'") != std::string::npos);
+    }
+}
+
 /* EVERY TOOL'S COPY OF THE SAME CLAUSE IS ONE CLAUSE TO THE PLAN. A tool-calling template writes
  * the same undeclared-parameter clause, the same free-text value and the same closing tags once
  * per tool, as rules of their own; the plan hash-conses rules by body, so its size -- and the

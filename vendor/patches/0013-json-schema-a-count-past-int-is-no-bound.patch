@@ -1,0 +1,54 @@
+diff --git a/common/json-schema-to-grammar.cpp b/common/json-schema-to-grammar.cpp
+index 95640fb..0bf2b72 100644
+--- a/common/json-schema-to-grammar.cpp
++++ b/common/json-schema-to-grammar.cpp
+@@ -904,6 +904,26 @@ public:
+     // which is how TypeBox's Type.Never and Arktype's "never" are exported, the latter as an
+     // optional property no call may set. A `not` of the empty schema makes its whole schema
+     // unsatisfiable whatever sits beside it, so the sibling keywords do not matter.
++    // RADIANCE: a count -- minLength, maxLength, minItems, maxItems -- as the int build_repetition
++    // takes, or `dflt` where the schema has none. get<int>() casts, so a bound past INT_MAX wrapped:
++    // Number.MAX_SAFE_INTEGER, a common way to write "no limit", came out as -1 and the grammar did
++    // not parse. A count at or past INT_MAX is INT_MAX, which build_repetition reads as no maximum;
++    // no context the engine serves holds a string or an array that long, so the bound changes
++    // nothing a generation can write. A count that is not a non-negative number is refused.
++    int _schema_count(const json & schema, const char * key, int dflt, const std::string & name) {
++        if (!schema.contains(key)) {
++            return dflt;
++        }
++        const json & v = schema[key];
++        const double d = v.is_number() ? v.get<double>() : -1.0;
++        if (!(d >= 0)) {
++            _errors.push_back(std::string(key) + " of \"" + (name.empty() ? std::string("root") : name) +
++                              "\" must be a non-negative number");
++            return dflt;
++        }
++        return d >= (double) std::numeric_limits<int>::max() ? std::numeric_limits<int>::max() : (int) d;
++    }
++
+     static bool is_unsatisfiable(const json & schema) {
+         if (schema.is_boolean()) return !schema.get<bool>();
+         if (!schema.is_object() || !schema.contains("not")) return false;
+@@ -1059,9 +1079,8 @@ public:
+                 return _add_rule(rule_name, rule);
+             }
+             std::string item_rule_name = visit(items, name + (name.empty() ? "" : "-") + "item");
+-            int min_items = schema.contains("minItems") ? schema["minItems"].get<int>() : 0;
+-            json max_items_json = schema.contains("maxItems") ? schema["maxItems"] : json();
+-            int max_items = max_items_json.is_number_integer() ? max_items_json.get<int>() : std::numeric_limits<int>::max();
++            int min_items = _schema_count(schema, "minItems", 0, name);
++            int max_items = _schema_count(schema, "maxItems", std::numeric_limits<int>::max(), name);
+ 
+             return _add_rule(rule_name, "\"[\" space " + build_repetition(item_rule_name, min_items, max_items, "\",\" space") + " \"]\" space");
+         }
+@@ -1077,8 +1096,8 @@ public:
+         }
+         if (schema_type == "string" && (schema.contains("minLength") || schema.contains("maxLength"))) {
+             std::string char_rule = _add_primitive("char", PRIMITIVE_RULES.at("char"));
+-            int min_len = schema.contains("minLength") ? schema["minLength"].get<int>() : 0;
+-            int max_len = schema.contains("maxLength") ? schema["maxLength"].get<int>() : std::numeric_limits<int>::max();
++            int min_len = _schema_count(schema, "minLength", 0, name);
++            int max_len = _schema_count(schema, "maxLength", std::numeric_limits<int>::max(), name);
+             return _add_rule(rule_name, "\"\\\"\" " + build_repetition(char_rule, min_len, max_len) + " \"\\\"\" space");
+         }
+         if (schema_type == "integer" && (schema.contains("minimum") || schema.contains("exclusiveMinimum") || schema.contains("maximum") || schema.contains("exclusiveMaximum"))) {

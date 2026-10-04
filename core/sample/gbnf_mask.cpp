@@ -928,7 +928,7 @@ struct Grammar {
     std::vector<std::vector<uint32_t>> tops;       /* class -> its terminal elements, reachable */
     std::vector<std::vector<uint32_t>> below;      /* rule -> entries that can sit below it */
     std::vector<char>     below_done;
-    std::vector<uint32_t> stamp;                 /* rule -> the below_of search that last saw it */
+    std::vector<uint32_t> stamp;                 /* rule -> the below search that last saw it */
     uint32_t              stamp_now = 0;
 
     explicit Grammar(const GbnfRuleSet& r, uint32_t rt) : R(r), root(rt) {}
@@ -1376,16 +1376,49 @@ static const std::vector<uint32_t>& below_of(Grammar& G, uint32_t r, OpWork& wor
     return out;
 }
 
-/* The entries that can sit directly below any of `pos`, as (class, element), sorted. */
+/* The entries that can sit directly below any of `pos`, as (class, element), sorted.
+ *
+ * ONE WALK FROM ALL OF `pos`'s RULES, not one below_of per rule. The links of a repetition chain
+ * hand over to each other by tail reference, so the walk up from one link climbs every link above
+ * it; and every link past the longest token is one class, so one key's positions are all n links
+ * of `x{0,n}`. Walked a rule at a time that is n^2/2 steps -- `maxLength: 32000` took two seconds
+ * to compile, and 48000 was refused for the work. Walked from every rule at once, each rule is
+ * visited once. A rule whose own set is already known contributes it and is not climbed past. A
+ * key of one rule, the common case, keeps the memo. */
 static void preds_of(Grammar& G, const MaskPlan& P, const std::vector<uint32_t>& pos,
                      std::vector<std::pair<uint32_t, uint32_t>>* out, OpWork& work) {
     out->clear();
-    uint32_t last_rule = kNone;
-    for (uint32_t p : pos) {
-        const uint32_t r = G.erule[p];
-        if (r == last_rule) continue;
-        last_rule = r;
-        for (uint32_t u : below_of(G, r, work)) out->push_back({ P.cls[u], u });
+    const uint32_t first = pos.empty() ? kNone : G.erule[pos[0]];
+    bool one_rule = true;
+    for (uint32_t p : pos)
+        if (G.erule[p] != first) { one_rule = false; break; }
+    if (one_rule) {
+        if (first != kNone)
+            for (uint32_t u : below_of(G, first, work)) out->push_back({ P.cls[u], u });
+    } else {
+        const uint32_t mark = ++G.stamp_now;
+        std::vector<uint32_t> todo;
+        for (uint32_t p : pos) {
+            const uint32_t r = G.erule[p];
+            if (G.stamp[r] != mark) { G.stamp[r] = mark; todo.push_back(r); }
+        }
+        work.add(pos.size());
+        while (!todo.empty()) {
+            const uint32_t b = todo.back();
+            todo.pop_back();
+            if (G.below_done[b]) {
+                for (uint32_t u : G.below[b]) out->push_back({ P.cls[u], u });
+                work.add(G.below[b].size() + 1);
+                continue;
+            }
+            for (uint32_t q : G.refs_to[b]) {
+                const uint32_t u = q + 1;
+                if (!is_end_of_sequence(&G.R.elems[u])) out->push_back({ P.cls[u], u });
+            }
+            for (uint32_t t : G.rev_tail[b])
+                if (G.stamp[t] != mark) { G.stamp[t] = mark; todo.push_back(t); }
+            work.add(G.refs_to[b].size() + G.rev_tail[b].size() + 1);
+        }
     }
     std::sort(out->begin(), out->end());
     out->erase(std::unique(out->begin(), out->end()), out->end());

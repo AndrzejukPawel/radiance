@@ -98,6 +98,7 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0009-chat-a-cdata-section-is-punctuation-not-content.patch
                    patches/0011-chat-add_bos-must-come-from-the-inputs.patch
                    patches/0012-json-schema-a-schema-no-value-satisfies.patch
+                   patches/0013-json-schema-a-count-past-int-is-no-bound.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -429,6 +430,17 @@ PATCH SERIES
       `string="true|false"` format), which give every argument an arm of its own and so never see
       the object, give an optional one of that kind no arm; a model that writes it reaches the
       undeclared-argument arm of 0010 where the format has one. core/text/chatfmt.cpp, the
-      declared-format grammar, does the same outside this tree. Where a value is required (a required property, the root, an array's items, a union
-      with no alternative left) it is still refused, by name. Every other `not` is refused as 0004
-      refuses it.
+      declared-format grammar, does the same outside this tree. Where a value is required (a
+      required property, the root, an array's items, a union with no alternative left) it is still
+      refused, by name. Every other `not` is refused as 0004 refuses it.
+
+  patches/0013-json-schema-a-count-past-int-is-no-bound.patch
+
+      minLength, maxLength, minItems and maxItems were read with get<int>(), which casts: a bound
+      past INT_MAX wrapped, and Number.MAX_SAFE_INTEGER -- a common way for a schema generator to
+      write "no limit" -- came out as -1 and the grammar failed to parse, failing the request with
+      it. A count at or past INT_MAX is now INT_MAX, which build_repetition already reads as no
+      maximum. That is exact for anything served here: no context holds a string or an array that
+      long. A count that is negative or not a number is refused by name. A float count is
+      truncated, where maxItems used to ignore one. The other half of the same report -- any count
+      past 2000 refused -- was the GBNF parser's, and is fixed in core/sample/gbnf.cpp.

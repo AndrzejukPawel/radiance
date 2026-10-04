@@ -30,11 +30,6 @@ using gbnf::match_token;
 using gbnf::kMaxCompileBytes;
 using gbnf::kMaxNesting;
 
-/* A repetition `S{m,n}` expands into rules, and the expansion multiplies. Past this many the
- * grammar is a denial of service against the machine that compiled it, so refuse rather than
- * allocate. Upstream calls it MAX_REPETITION_THRESHOLD and picks the same number. */
-static constexpr uint64_t MAX_REPETITION_THRESHOLD = 2000;
-
 namespace gbnf {
 
 void throw_set_limit() {
@@ -254,6 +249,19 @@ static const char* parse_int(const char* src) {
     return pos;
 }
 
+/* The repetition count written in [src, end), which parse_int has checked is digits. A count past
+ * 2^64 - 2 is refused here; any smaller one is the compile budget's to judge, by what it expands
+ * to (handle_repetitions). UINT64_MAX itself is reserved for "no maximum". */
+static uint64_t parse_count(const char* src, const char* end) {
+    uint64_t v = 0;
+    for (const char* p = src; p < end; ++p)
+        if (__builtin_mul_overflow(v, 10u, &v) ||
+            __builtin_add_overflow(v, (uint64_t)(*p - '0'), &v) || v == UINT64_MAX)
+            throw std::runtime_error("repetition count " + std::string(src, (size_t)(end - src)) +
+                                     " is past what any grammar can expand to");
+    return v;
+}
+
 static std::pair<uint32_t, const char*> parse_char(const char* src) {
     if (*src == '\\') {
         switch (src[1]) {
@@ -311,12 +319,14 @@ static std::pair<uint32_t, const char*> parse_token(const VocabView* vocab, cons
 /* What a symbol costs beyond its name: the map node that holds it and the rule slot it owns. */
 static constexpr uint64_t kSymbolOverhead = 64 + sizeof(GbnfRule);
 
+/* Saturating: `bytes` may be a count from the grammar text times a size, and a sum that wrapped
+ * would pass. budget_used_ never exceeds the budget, so the comparison cannot overflow. */
 void GbnfParser::charge(uint64_t bytes) {
-    budget_used_ += bytes;
-    if (budget_used_ > kMaxCompileBytes)
+    if (bytes > kMaxCompileBytes - budget_used_)
         throw std::runtime_error("the grammar expands past " +
                                  std::to_string(kMaxCompileBytes >> 20) + " MiB when compiled; "
                                  "reduce its repetition counts or the size of what they repeat");
+    budget_used_ += bytes;
 }
 
 uint32_t GbnfParser::get_symbol_id(const char* src, size_t len) {
@@ -358,14 +368,21 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
                                        GbnfRule& rule, bool is_nested) {
     size_t last_sym_start = rule.size();
     const char* pos = src;
-    uint64_t n_prev_rules = 1;
 
     /* S{m,n} is rewritten into rules rather than counted at match time, which is what keeps the
      * state machine a pushdown automaton with no counters in it:
      *   S{m,n} -> S S ... (m times) S'(n-m),  S'(x) ::= S S'(x-1) |
      *   S{m,}  -> S S ... (m times) S',       S'    ::= S S' |
      *   S*     -> S{0,}     S+ -> S{1,}       S? -> S{0,1}
-     * The cost is that the rule count multiplies, which is why the threshold above exists. */
+     *
+     * WHAT BOUNDS THE EXPANSION IS ITS SIZE, charged to the compile budget before any of it is
+     * made, and not a count of repetitions. Upstream refuses any count past 2000, and a JSON
+     * schema's `maxLength: 8000` -- an ordinary bound on a tool's free-text argument -- failed
+     * every request carrying the tool. The expansion is linear in the count: each optional link
+     * is a rule of a few elements and a generated name, and nothing after the parse is worse than
+     * linear in the rules (find_left_recursion, and the mask plan, which gives every link past
+     * the longest token one class). So `[^"]{0,8000}` costs about a megabyte and compiles to the
+     * plan `[^"]{0,1999}` does, and a count the budget cannot hold is refused naming its rule. */
     auto handle_repetitions = [&](uint64_t min_times, uint64_t max_times) {
         const bool no_max = max_times == UINT64_MAX;
         if (last_sym_start == rule.size())
@@ -379,54 +396,59 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
 
         const GbnfRule prev_rule(rule.begin() + (std::ptrdiff_t)last_sym_start, rule.end());
 
-        uint64_t total_rules = 1;
-        if (!no_max && max_times > 0)  total_rules = max_times;
-        else if (min_times > 0)        total_rules = min_times;
+        /* A refusal names the repetition: the count is what a client wrote. */
+        try {
+            /* The copies about to be made: the operand once per required count beyond the
+             * first, and once more in each optional rule with its reference, ALT and END. The
+             * counts are the grammar's own, up to 2^64 - 2, so the arithmetic saturates where it
+             * would wrap: a count past the budget is refused here, before the loops below start.
+             * Each generated rule's name and slot are charged again as it is made
+             * (generate_symbol_id). */
+            {
+                const uint64_t w      = prev_rule.size();
+                const uint64_t n_rest = no_max ? 1 : max_times - min_times;
+                uint64_t req = 0, opt = 0, copies = 0, bytes = 0;
+                const bool wraps =
+                    __builtin_mul_overflow(min_times > 1 ? min_times - 1 : 0, w, &req) ||
+                    __builtin_mul_overflow(n_rest, w + 3, &opt) ||
+                    __builtin_add_overflow(req, opt, &copies) ||
+                    __builtin_mul_overflow(copies, (uint64_t)sizeof(GbnfElement), &bytes);
+                charge(wraps ? UINT64_MAX : bytes);
+            }
 
-        if (n_prev_rules * total_rules >= MAX_REPETITION_THRESHOLD)
-            throw std::runtime_error("repeated rules multiplied past the sane limit; reduce the "
-                                     "number of repetitions or the rule's complexity");
+            if (min_times == 0) {
+                rule.resize(last_sym_start);
+            } else {
+                for (uint64_t i = 1; i < min_times; i++)
+                    rule.insert(rule.end(), prev_rule.begin(), prev_rule.end());
+            }
 
-        /* The copies about to be made: the operand once per required count beyond the first, and
-         * once more in each optional rule with its reference, ALT and END. Both counts are below
-         * MAX_REPETITION_THRESHOLD here, so the product cannot overflow. */
-        {
-            const uint64_t w      = prev_rule.size();
-            const uint64_t n_rest = no_max ? 1 : max_times - min_times;
-            const uint64_t copies = (min_times > 1 ? (min_times - 1) * w : 0) + n_rest * (w + 3);
-            charge(copies * sizeof(GbnfElement));
+            uint32_t last_rec_rule_id = 0;
+            const uint64_t n_opt = no_max ? 1 : max_times - min_times;
+
+            GbnfRule rec_rule(prev_rule);
+            for (uint64_t i = 0; i < n_opt; i++) {
+                rec_rule.resize(prev_rule.size());
+                const uint32_t rec_rule_id = generate_symbol_id(rule_name);
+                if (i > 0 || no_max)
+                    rec_rule.push_back({ GRE_RULE_REF, no_max ? rec_rule_id : last_rec_rule_id });
+                rec_rule.push_back({ GRE_ALT, 0 });
+                rec_rule.push_back({ GRE_END, 0 });
+                add_rule(rec_rule_id, rec_rule);
+                last_rec_rule_id = rec_rule_id;
+            }
+            if (n_opt > 0) rule.push_back({ GRE_RULE_REF, last_rec_rule_id });
+        } catch (const std::runtime_error& ex) {
+            throw std::runtime_error("the repetition {" + std::to_string(min_times) + "," +
+                                     (no_max ? std::string() : std::to_string(max_times)) + "}: " +
+                                     ex.what());
         }
-
-        if (min_times == 0) {
-            rule.resize(last_sym_start);
-        } else {
-            for (uint64_t i = 1; i < min_times; i++)
-                rule.insert(rule.end(), prev_rule.begin(), prev_rule.end());
-        }
-
-        uint32_t last_rec_rule_id = 0;
-        const uint64_t n_opt = no_max ? 1 : max_times - min_times;
-
-        GbnfRule rec_rule(prev_rule);
-        for (uint64_t i = 0; i < n_opt; i++) {
-            rec_rule.resize(prev_rule.size());
-            const uint32_t rec_rule_id = generate_symbol_id(rule_name);
-            if (i > 0 || no_max)
-                rec_rule.push_back({ GRE_RULE_REF, no_max ? rec_rule_id : last_rec_rule_id });
-            rec_rule.push_back({ GRE_ALT, 0 });
-            rec_rule.push_back({ GRE_END, 0 });
-            add_rule(rec_rule_id, rec_rule);
-            last_rec_rule_id = rec_rule_id;
-        }
-        if (n_opt > 0) rule.push_back({ GRE_RULE_REF, last_rec_rule_id });
-        n_prev_rules *= total_rules;
     };
 
     while (*pos) {
         if (*pos == '"') {                                   /* literal string */
             pos++;
             last_sym_start = rule.size();
-            n_prev_rules = 1;
             while (*pos != '"') {
                 if (!*pos) throw std::runtime_error("unexpected end of input");
                 auto cp = parse_char(pos);
@@ -439,7 +461,6 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
             GreType start_type = GRE_CHAR;
             if (*pos == '^') { pos++; start_type = GRE_CHAR_NOT; }
             last_sym_start = rule.size();
-            n_prev_rules = 1;
             while (*pos != ']') {
                 if (!*pos) throw std::runtime_error("unexpected end of input");
                 auto cp = parse_char(pos);
@@ -459,7 +480,6 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
             if (*pos == '!') { type = GRE_TOKEN_NOT; pos++; }
             auto tp = parse_token(vocab_, pos);
             last_sym_start = rule.size();
-            n_prev_rules = 1;
             rule.push_back({ type, tp.first });
             pos = parse_space(tp.second, is_nested);
         } else if (is_word_char(*pos)) {                     /* rule reference */
@@ -467,25 +487,21 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
             const uint32_t ref = get_symbol_id(pos, (size_t)(name_end - pos));
             pos = parse_space(name_end, is_nested);
             last_sym_start = rule.size();
-            n_prev_rules = 1;
             rule.push_back({ GRE_RULE_REF, ref });
         } else if (*pos == '(') {                            /* grouping */
             if (++depth_ > kMaxNesting)
                 throw std::runtime_error("parentheses nest more than " +
                                          std::to_string(kMaxNesting) + " deep");
             pos = parse_space(pos + 1, true);
-            const uint32_t n_before = (uint32_t)symbol_ids_.size();
             const uint32_t sub_rule_id = generate_symbol_id(rule_name);
             pos = parse_alternates(pos, rule_name, sub_rule_id, true);
             --depth_;
-            n_prev_rules = std::max(1u, (uint32_t)symbol_ids_.size() - n_before);
             last_sym_start = rule.size();
             rule.push_back({ GRE_RULE_REF, sub_rule_id });
             if (*pos != ')') throw std::runtime_error(std::string("expecting ')' at ") + pos);
             pos = parse_space(pos + 1, is_nested);
         } else if (*pos == '.') {                            /* any char */
             last_sym_start = rule.size();
-            n_prev_rules = 1;
             rule.push_back({ GRE_CHAR_ANY, 0 });
             pos = parse_space(pos + 1, is_nested);
         } else if (*pos == '*') {
@@ -502,7 +518,7 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
             if (!is_digit_char(*pos))
                 throw std::runtime_error(std::string("expecting an int at ") + pos);
             const char* int_end = parse_int(pos);
-            const uint64_t min_times = std::stoull(std::string(pos, (size_t)(int_end - pos)));
+            const uint64_t min_times = parse_count(pos, int_end);
             pos = parse_space(int_end, is_nested);
 
             uint64_t max_times = UINT64_MAX;
@@ -513,7 +529,7 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
                 pos = parse_space(pos + 1, is_nested);
                 if (is_digit_char(*pos)) {
                     const char* e = parse_int(pos);
-                    max_times = std::stoull(std::string(pos, (size_t)(e - pos)));
+                    max_times = parse_count(pos, e);
                     pos = parse_space(e, is_nested);
                 }
                 if (*pos != '}') throw std::runtime_error(std::string("expecting '}' at ") + pos);
@@ -521,10 +537,6 @@ const char* GbnfParser::parse_sequence(const char* src, const std::string& rule_
             } else {
                 throw std::runtime_error(std::string("expecting ',' at ") + pos);
             }
-            const bool has_max = max_times != UINT64_MAX;
-            if (min_times > MAX_REPETITION_THRESHOLD ||
-                (has_max && max_times > MAX_REPETITION_THRESHOLD))
-                throw std::runtime_error("number of repetitions exceeds the sane limit");
             handle_repetitions(min_times, max_times);
         } else {
             break;
@@ -544,7 +556,14 @@ const char* GbnfParser::parse_rule(const char* src) {
         throw std::runtime_error(std::string("expecting ::= at ") + pos);
     pos = parse_space(pos + 3, true);
 
-    pos = parse_alternates(pos, name, rule_id, false);
+    /* An error inside a rule names the rule. A grammar written from a JSON schema or a tool list
+     * names its rules after the tool and the property, so this is what tells a client which part
+     * of its request the grammar could not hold. */
+    try {
+        pos = parse_alternates(pos, name, rule_id, false);
+    } catch (const std::runtime_error& ex) {
+        throw std::runtime_error("rule '" + name + "': " + ex.what());
+    }
 
     if (*pos == '\r')      pos += pos[1] == '\n' ? 2 : 1;
     else if (*pos == '\n') pos++;
