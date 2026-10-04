@@ -359,6 +359,13 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   add_subdirectory(libavx)
 endif()
+# libstage: the staged collectives for machines without PCIe P2P. A kernel
+# library like any other -- built in-tree and standalone, shipped in the home,
+# and selected ahead of libr4d's P2P rows with --kernels where there is no
+# peer path. Needs the HIP backend: its transport is device kernels.
+if(RAD_HIP_FOUND)
+  add_subdirectory(libstage)
+endif()
 add_subdirectory(arch)
 add_subdirectory(tools)
 if(RAD_BUILD_TESTS)

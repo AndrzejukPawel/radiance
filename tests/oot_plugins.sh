@@ -45,13 +45,13 @@ dirs="libref libquant"
 for d in "$S"/arch/*/; do
   [ -f "$d/CMakeLists.txt" ] && dirs="$dirs arch/$(basename "$d")"
 done
-[ -n "$HIPC" ] && dirs="$dirs libr4d"
+[ -n "$HIPC" ] && dirs="$dirs libr4d libstage"
 
 for d in $dirs; do
   n=$(basename "$d")
   say "building $d against the installed package"
   extra=""
-  [ "$n" = libr4d ] && extra="-DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT"
+  [ "$n" = libr4d ] || [ "$n" = libstage ] && extra="-DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT"
   # shellcheck disable=SC2086
   run "$W/logs/$n.configure.log" cmake -S "$S/$d" -B "$W/b/$n" -G "$GEN" \
       -DCMAKE_PREFIX_PATH="$P" -DRAD_PLUGIN_INSTALL_HOME="$H" $extra
