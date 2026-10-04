@@ -127,7 +127,11 @@ The container names are the files the README's model table downloads or converts
 Copy the directory to the serving host and fill in `.env` from `.env.example`. It sets the image,
 the models directory (mounted read-only at `/models`), a writable state directory (`/data`, where
 the prefix cache's disk tier lives), the API key, the port, and the user and GPU groups the server
-runs as. Then:
+runs as. The models directory has to be on a local filesystem that does direct I/O, such as ext4,
+XFS or btrfs: Qwen3.8-Flash-Next reads its n-gram table from the container that way. On btrfs with
+compression on, the extents it stored compressed are read through the page cache instead, which
+works but loses what the direct reads are for; a container copied into a directory set `chattr +C`
+is stored uncompressed. Then:
 
 ```sh
 docker compose -f flashnext.yaml up -d      # start; restarts with the Docker daemon

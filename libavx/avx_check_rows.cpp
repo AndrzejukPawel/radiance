@@ -17,8 +17,10 @@
  *
  * Every output row is compared bit for bit with that id's bytes in the file through the call's
  * scale, and a padding id must come back as a zero row. The row is 40 codes, so the AVX-512 decode
- * takes one full 32-code step and a masked tail. The table is a file in `dir` rather than under
- * TMPDIR, because the gather reads with O_DIRECT and a tmpfs refuses it. */
+ * takes one full 32-code step and a masked tail. The table is a file in `dir`, and the filesystem
+ * there decides how the gather aligns its direct reads: by the alignment the filesystem reports
+ * (ext4, XFS), or by its block size where it reports none (btrfs, and a tmpfs since Linux 6.6). The
+ * case says which it ran. */
 #include "avx_harness.h"
 
 #include <barrier>
@@ -80,14 +82,18 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
         if (!wrote) { ::unlink(path.c_str()); std::printf("  %s: short write\n", what);
                       return false; }
     }
-    /* A filesystem without direct I/O -- a tmpfs -- is one the gather refuses by design, so the
-     * case cannot run there; it says so rather than counting a refusal per call. */
+    /* A filesystem without direct I/O -- one that refuses the open, as a tmpfs did before Linux
+     * 6.6, or one that reports the file has none -- is one the gather refuses by design, so the
+     * case cannot run there; it says so rather than counting a refusal per call. Every other
+     * filesystem the gather has to read, with or without a reported alignment. */
+    bool reported = false;
     {
         const int dfd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         struct statx sx {};
         const bool dio = dfd >= 0 &&
                          ::statx(dfd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 &&
-                         (sx.stx_mask & STATX_DIOALIGN) && sx.stx_dio_offset_align != 0;
+                         !((sx.stx_mask & STATX_DIOALIGN) && sx.stx_dio_offset_align == 0);
+        reported = (sx.stx_mask & STATX_DIOALIGN) != 0;
         if (dfd >= 0) ::close(dfd);
         if (!dio) {
             ::unlink(path.c_str());
@@ -95,6 +101,8 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
             return true;
         }
     }
+    const char* granule = reported ? "the alignment the filesystem reports"
+                                   : "no alignment reported, read by the block size";
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     void* map = fd < 0 ? MAP_FAILED : mmap(nullptr, (size_t)(V * rb), PROT_READ, MAP_SHARED, fd, 0);
     if (fd >= 0) ::close(fd);
@@ -181,11 +189,12 @@ bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool
 
     const bool pass = bad[0] + bad[1] + refused[0] + refused[1] == 0;
     if (verbose || !pass)
-        std::printf("  %s: %lld calls x 2 ranks, rows wrong %lld/%lld, "
-                    "calls refused %lld/%lld %s\n", what, (long long)calls, (long long)bad[0],
-                    (long long)bad[1], (long long)refused[0], (long long)refused[1],
-                    pass ? "ok" : "FAIL");
+        std::printf("  %s in %s (%s): %lld calls x 2 ranks, rows wrong %lld/%lld, "
+                    "calls refused %lld/%lld %s\n", what, dir.c_str(), granule, (long long)calls,
+                    (long long)bad[0], (long long)bad[1], (long long)refused[0],
+                    (long long)refused[1], pass ? "ok" : "FAIL");
     else
-        std::printf("  %s: %lld calls x 2 ranks, every row exact\n", what, (long long)calls);
+        std::printf("  %s in %s (%s): %lld calls x 2 ranks, every row exact\n", what, dir.c_str(),
+                    granule, (long long)calls);
     return pass;
 }

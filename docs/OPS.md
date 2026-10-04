@@ -866,7 +866,10 @@ the wrong shape, pinning it for zero-copy needs all 51.2 GB pinned in host RAM, 
 `hipHostRegister` on the container's mapping would force all of it resident. The container is
 mmapped, so the table is at a host address on open. libavx keeps the rows a gather
 has touched in a row cache of its own and reads a miss straight from the file with O_DIRECT
-(`libavx/avx_ngram.cpp`): the page cache would map a 4 KiB page per 160-byte row.
+(`libavx/avx_ngram.cpp`): the page cache would map a 4 KiB page per 160-byte row. The reads keep
+the alignment the filesystem reports for direct I/O, or its block size where it reports none, as
+btrfs does; one read of the table proves it before the first row is served. A filesystem with no
+direct I/O at all cannot hold a container with this table.
 
 The placement planner runs an op on the host when **every weight operand of it** is `Site::Host`,
 which is why the table must be a weight operand at all: `gather_rows` takes a plain `IN` operand and

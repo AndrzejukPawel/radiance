@@ -156,8 +156,9 @@ endif()
 #
 # rad-avx-check holds libavx to libref, op for op and at every ISA level the machine executes, and
 # runs embed_lookup_q over a file-backed table with two ranks and the read-ahead racing: the path a
-# model's host gather takes and that no geometry reaches. It writes its table beside itself, since
-# the gather reads with O_DIRECT and a tmpfs refuses it.
+# model's host gather takes and that no geometry reaches. It writes its table beside itself, where
+# the filesystem reports its direct-I/O alignment, and again in TMPDIR, where a tmpfs reports none
+# and the gather aligns its reads by the block size, as it does on btrfs.
 if(TARGET libavx AND TARGET rad-avx-check)
   add_test(NAME avx_check
            COMMAND rad-avx-check --ref ${RAD_PLUGIN_OUT}/kernels/libref.so

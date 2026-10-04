@@ -930,7 +930,8 @@ int main(int argc, char** argv) {
             if (!hand_cases(ref, avx, verbose, &hand_checked)) rc = 1;
         }
         if (only_op.empty() || only_op == "embed_lookup_q") {
-            /* Beside the binary: the table is read with O_DIRECT, which a tmpfs refuses. */
+            /* Beside the binary, on the build's filesystem, which reports its direct-I/O
+             * alignment wherever the build is on ext4 or XFS. */
             const std::string self = argv[0];
             const size_t sl = self.rfind('/');
             const std::string at = sl == std::string::npos ? "." : self.substr(0, sl);
@@ -938,6 +939,11 @@ int main(int argc, char** argv) {
              * served as it ships carries: one path, two row sizes. */
             if (!row_gather_case(avx, at, 1000, verbose, false)) rc = 1;
             if (!row_gather_case(avx, at, 1000, verbose, true)) rc = 1;
+            /* And in TMPDIR, which is a tmpfs on most machines: since Linux 6.6 a tmpfs does
+             * direct reads and reports no alignment for them, as btrfs does, so the gather finds
+             * its granule from the block size there. */
+            const char* tmp = std::getenv("TMPDIR");
+            if (!row_gather_case(avx, tmp && *tmp ? tmp : "/tmp", 1000, verbose, false)) rc = 1;
         }
     }
     if (!declined_ops.empty()) {

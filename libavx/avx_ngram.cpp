@@ -56,7 +56,8 @@
  * THE FILE COMES FROM THE MAPPING. The table operand is a pointer into the container's mmap and the
  * plugin ABI carries no file, so /proc/self/maps says which file and offset back that address, once
  * a table. A table no file backs -- a test's heap buffer -- is read as the memory it is. A file on a
- * filesystem that cannot do direct I/O is refused. */
+ * filesystem that cannot do direct I/O is refused; direct_granule below finds the alignment the
+ * reads keep, including on a filesystem that does not report one. */
 #include "avx_rows.h"
 #include "avx_common.h"
 
@@ -121,14 +122,20 @@ struct Gather {
     std::vector<uint16_t*>      bdst;
     uint8_t*              bounce = nullptr;
     size_t                bounce_bytes = 0;
+    size_t                bounce_align = 0;
 
     enum : uint8_t { PAD = 16, DONE };
 
-    uint8_t* bounce_for(size_t bytes) {
-        if (bytes > bounce_bytes) {
+    /* A buffer of at least `bytes` on a page and on `align`, a power of two: a direct read's
+     * buffer has to keep the file's granule, which a filesystem with large blocks puts above a
+     * page. */
+    uint8_t* bounce_for(size_t bytes, size_t align) {
+        if (align < 4096) align = 4096;
+        if (bytes > bounce_bytes || align > bounce_align) {
             std::free(bounce);
-            bounce = static_cast<uint8_t*>(std::aligned_alloc(4096, (bytes + 4095) & ~(size_t)4095));
+            bounce = static_cast<uint8_t*>(std::aligned_alloc(align, (bytes + align - 1) & ~(align - 1)));
             bounce_bytes = bounce ? bytes : 0;
+            bounce_align = bounce ? align : 0;
         }
         return bounce;
     }
@@ -152,6 +159,80 @@ struct TableFile {
     long long      off   = 0;
     long long      align = 0;
 };
+
+/* THE GRANULE OF A DIRECT READ of `t`'s file, opened for them as `t.fd`: the alignment a read's
+ * file offset, its length and its buffer's address must all keep. 0, with `*why` saying why, when
+ * the file cannot be read that way. [p, p + n) is the table, inside the mapping, and `ino` the
+ * mapped file's inode.
+ *
+ * STATX_DIOALIGN is the filesystem's own answer, and not every filesystem gives one: btrfs does
+ * direct reads and reports nothing, and so does a tmpfs since Linux 6.6. Without the report the
+ * granule is the file's block size, stx_blksize. No block filesystem's direct reads need more --
+ * a filesystem's blocks are never smaller than its device's sectors -- and btrfs needs exactly
+ * that: its sector size, below which it does not refuse a direct read but serves it through the
+ * page cache instead.
+ *
+ * Reported or not, one read proves the granule before any row is served: a span of the table at
+ * an offset and into a buffer each aligned to the granule and to no more, which has to return the
+ * bytes the mapping holds there. That catches a filesystem refusing the granule and a file that is
+ * not the one mapped. A btrfs serving the read through the page cache returns the right bytes and
+ * passes it; the block size is what keeps btrfs off that path. */
+long long direct_granule(const TableFile& t, const uint8_t* p, long long n, unsigned long long ino,
+                         const char* path, const char** why) {
+    struct statx sx;
+    std::memset(&sx, 0, sizeof sx);
+    if (::statx(t.fd, "", AT_EMPTY_PATH, STATX_INO | STATX_DIOALIGN, &sx) != 0) {
+        *why = std::strerror(errno);
+        return 0;
+    }
+    if (!(sx.stx_mask & STATX_INO) || sx.stx_ino != ino) {
+        *why = "the file opened is not the one mapped";
+        return 0;
+    }
+    const bool reported = (sx.stx_mask & STATX_DIOALIGN) != 0;
+    if (reported && sx.stx_dio_offset_align == 0) {
+        *why = "the filesystem says this file has no direct I/O";
+        return 0;
+    }
+    const long long a = !reported ? (long long)sx.stx_blksize
+                      : sx.stx_dio_offset_align > sx.stx_dio_mem_align
+                      ? (long long)sx.stx_dio_offset_align : (long long)sx.stx_dio_mem_align;
+    if (a <= 0 || (a & (a - 1))) {
+        *why = reported ? "the filesystem's direct-I/O alignment is not a power of two"
+                        : "the filesystem reports no direct-I/O alignment, and its block size is "
+                          "not a power of two";
+        return 0;
+    }
+
+    /* An odd multiple of the granule, so neither the offset nor the buffer keeps more than it. */
+    const long long tab_lo = t.off + (long long)(p - t.lo);
+    long long o = (tab_lo + a - 1) & ~(a - 1);
+    if ((o / a) % 2 == 0) o += a;
+    if (o + a > tab_lo + n) {
+        *why = "the table is smaller than one direct read";
+        return 0;
+    }
+    uint8_t* buf = static_cast<uint8_t*>(std::aligned_alloc((size_t)(2 * a), (size_t)(2 * a)));
+    if (!buf) {
+        *why = "no memory for a read";
+        return 0;
+    }
+    const ssize_t got = ::pread(t.fd, buf + a, (size_t)a, (off_t)o);
+    const int e = errno;
+    const bool same = got == a && std::memcmp(buf + a, t.lo + (o - t.off), (size_t)a) == 0;
+    std::free(buf);
+    if (!same) {
+        *why = got < 0  ? std::strerror(e)
+             : got != a ? "a read of one granule came back short"
+                        : "a read returned other bytes than the mapping holds";
+        return 0;
+    }
+    if (!reported)
+        std::fprintf(stderr, "libavx: %s: the filesystem reports no direct-I/O alignment, so the "
+                     "n-gram table is read in spans of its block size, %lld bytes; a direct read "
+                     "of one returned the file's bytes\n", path, a);
+    return a;
+}
 
 /* The file behind [p, p + n): the mapping holding `p`, extended over the mappings that continue it
  * in the same file (a madvise over a sub-range splits one mapping into several). Looked up once per
@@ -207,21 +288,16 @@ const TableFile* table_file(const uint8_t* p, long long n, int* err) {
         if ((uintptr_t)(p + n) > end) { *err = RAD_E_IO; return nullptr; }
         t->hi = (const uint8_t*)end;
         t->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        struct statx sx;
-        std::memset(&sx, 0, sizeof sx);
-        if (t->fd < 0 || ::statx(t->fd, "", AT_EMPTY_PATH, STATX_INO | STATX_DIOALIGN, &sx) != 0 ||
-            sx.stx_ino != ino || !(sx.stx_mask & STATX_DIOALIGN) || sx.stx_dio_offset_align == 0) {
+        const char* why = t->fd < 0 ? std::strerror(errno) : nullptr;
+        if (t->fd >= 0) t->align = direct_granule(*t, p, n, ino, path.c_str(), &why);
+        if (t->align == 0) {
             std::fprintf(stderr, "libavx: %s cannot be read with direct I/O (%s); the n-gram table "
-                         "is read that way\n", path.c_str(),
-                         t->fd < 0 ? std::strerror(errno) : "the filesystem reports no alignment");
+                         "is read that way. A local filesystem with direct I/O -- ext4, XFS, "
+                         "btrfs -- can hold the container\n", path.c_str(), why);
             if (t->fd >= 0) ::close(t->fd);
             *err = RAD_E_UNSUPPORTED;
             return nullptr;
         }
-        const long long a = sx.stx_dio_offset_align > sx.stx_dio_mem_align
-                          ? sx.stx_dio_offset_align : sx.stx_dio_mem_align;
-        if (a & (a - 1)) { ::close(t->fd); *err = RAD_E_UNSUPPORTED; return nullptr; }
-        t->align = a;
     }
     known.push_back(std::move(t));
     return known.back().get();
@@ -479,7 +555,7 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     const size_t    total  = reads.size();
     for (size_t b = 0; b < total;) {
         const unsigned cnt = (unsigned)(total - b < rr.entries ? total - b : rr.entries);
-        uint8_t* bounce = g.bounce_for((size_t)cnt * (size_t)stride);
+        uint8_t* bounce = g.bounce_for((size_t)cnt * (size_t)stride, (size_t)A);
         const int rs = bounce ? rr.read_spans(tf, &reads[b], cnt, n, stride, bounce) : RAD_E_NOMEM;
         if (rs != RAD_OK) {
             for (size_t i = b; i < total; ++i)
