@@ -1,0 +1,150 @@
+/* chatdiff.h -- the streaming reply parser beside the legacy parser, on the same request.
+ *
+ * Shared by tests/chatparse_test.cpp and tools/rad_chatparse.cpp. A Bench holds one model's chat
+ * template, its reply format and, for one rendered request, both parsers: the legacy path
+ * (toolparse_legacy.h, the `old` side) and the streaming parser (core/text/chatparse.h, the `new`
+ * side). compare() says whether they agree on a reply and, when they do not, which side left its
+ * grammar; check_stream() feeds a reply to the streaming parser in pieces and checks the streaming
+ * contract on every piece.
+ */
+#pragma once
+#include "text/chat.h"
+#include "text/chatfmt.h"
+#include "text/chatparse.h"
+#include "toolparse_legacy.h"
+
+#include <nlohmann/json.hpp>
+
+#include <memory>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace rad {
+namespace chatdiff {
+
+using ojson = nlohmann::ordered_json;
+
+/* A model: where its template is and how its vocabulary spells the tokens a template reads. */
+struct Model {
+    std::string name;
+    std::string dir;                          /* under the fixture root */
+    std::string bos, eos;
+    std::vector<std::string> terminators;     /* its end-of-generation spellings */
+};
+const std::vector<Model>& models();
+
+/* How a request is rendered. */
+struct ChatRequest {
+    bool tools = true;
+    bool parallel = true;
+    bool thinking = true;
+    bool reasoning = true;                    /* reasoning_format "auto"; false is "none" */
+    std::string schema;                       /* a response format's schema, "" for none */
+};
+std::string describe(const ChatRequest& r);
+
+/* An agent-shaped tool set, with every argument type the formats distinguish. */
+const ojson& agent_tools();
+
+class Bench {
+public:
+    /* RAD_OK, or a status with *why. `jinja` is the template's text. */
+    int load(const Model& m, const std::string& jinja, std::string* why);
+    int bind(const ChatRequest& rq, const ojson& tools, std::string* why);
+
+    const Model& model() const { return model_; }
+    const ChatFormat& format() const { return fmt_; }
+    const ChatPrompt& prompt() const { return prompt_; }
+    const ReplyParser& parser() const { return *parser_; }
+    std::shared_ptr<const ReplyParser> parser_ptr() const { return parser_; }
+    const legacy::ToolParser& old_parser() const { return *old_; }
+    const ChatRequest& request() const { return req_; }
+    const ChatTemplate& tmpl() const { return *tmpl_; }
+
+    legacy::Answer old_parse(const std::string& text, bool partial = false) const;
+    ReplyMessage new_parse(const std::string& text, bool* strict = nullptr) const;
+
+    /* The reply as the template writes an assistant turn -- which is exactly what the model is
+     * trained to produce -- without the turn terminator the decoder would not render. "" when the
+     * template does not render the turn as a continuation of the generation prompt. */
+    std::string render_reply(const ojson& assistant) const;
+
+private:
+    Model model_;
+    std::string jinja_;
+    std::shared_ptr<ChatTemplate> tmpl_;
+    ChatFormat fmt_;
+    std::shared_ptr<const ReplyFormat> rf_;
+    ChatRequest req_;
+    ojson tools_;
+    ChatPrompt prompt_;
+    std::unique_ptr<legacy::ToolParser> old_;
+    std::shared_ptr<const ReplyParser> parser_;
+};
+
+struct Verdict {
+    bool same = false;          /* the two answers are identical */
+    bool strict = false;        /* the streaming parser read the reply within the grammar */
+    bool old_clean = false;     /* the legacy strict parse matched and nothing was lifted */
+    bool bare_lift = false;     /* the legacy path lifted a call written without the call opener */
+    /* The legacy answer's content still carries a wrapped format's call syntax -- a call written
+     * without its wrapper, which the legacy lifter takes only when nothing else in the reply
+     * parses as a call, and which the streaming parser always reads as one. */
+    bool old_call_syntax = false;
+    std::string detail;         /* both answers, when they differ */
+};
+Verdict compare(const Bench& b, const std::string& text);
+
+/* Whether a verdict is one the streaming parser is allowed: identical where both read the reply
+ * within the grammar, and a documented difference otherwise. "" or the reason it is not. */
+std::string judge(const Verdict& v);
+
+/* Feed `text` to a fresh stream cut at `cuts` (ascending offsets), checking on every piece that
+ * what has been emitted is a prefix of `expect` and that the held bytes stay under the bound, and
+ * at the end that the concatenated deltas and the message both equal `expect`. "" or the first
+ * violation. */
+std::string check_stream(const ReplyParser& p, const std::string& text,
+                         const std::vector<size_t>& cuts, const ReplyMessage& expect);
+
+std::string show(const ReplyMessage& m);
+std::string show(const legacy::Answer& a);
+bool same(const ReplyMessage& a, const ReplyMessage& b);
+
+/* Replace every byte that is not part of well-formed UTF-8 with U+FFFD, as the decoder does
+ * before any reply reaches a parser. */
+std::string sanitize(const std::string& s);
+
+
+/* ================================================================== the corpora */
+
+bool is_qwen(const Model& m);
+
+/* A call, and an assistant message carrying calls, OpenAI-shaped. */
+ojson call(const std::string& name, const ojson& args);
+ojson message(const std::string& reasoning, const std::string& content,
+              const std::vector<ojson>& calls);
+
+/* Assistant messages that, rendered through a model's template, are the replies the model is
+ * trained to write: content only, reasoning, one to five calls, every argument type, unicode, and
+ * values holding the format's own punctuation. */
+std::vector<ojson> rendered_corpus();
+
+/* Replies written by hand in a model's own spelling: the shapes models actually write when they
+ * leave their format, and the ones a streaming parser is easiest to get wrong. */
+struct Adversarial { std::string name, text; };
+std::vector<Adversarial> adversarial(const Model& m);
+
+/* One call in a model's spelling. */
+std::string C(const Model& m, const std::string& name,
+              const std::vector<std::pair<std::string, std::string>>& args);
+
+/* The pieces random replies are assembled from, and a random edit of a reply. */
+std::vector<std::string> fragments(const Model& m);
+std::string mutate(std::mt19937& rng, std::string s, const std::vector<std::string>& frag);
+
+/* About `target` bytes of reasoning, prose and one call writing a file. */
+std::string long_reply(const Model& m, size_t target);
+
+}  /* namespace chatdiff */
+}  /* namespace rad */

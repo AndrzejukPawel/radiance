@@ -1,0 +1,72 @@
+diff --git a/common/chat-peg-parser.cpp b/common/chat-peg-parser.cpp
+index 111acd0..b674d6e 100644
+--- a/common/chat-peg-parser.cpp
++++ b/common/chat-peg-parser.cpp
+@@ -51,6 +51,54 @@ static std::string_view strip_one_leading_newline(std::string_view sv) {
+     return sv;
+ }
+ 
++// RADIANCE: A CDATA SECTION IS PUNCTUATION, NOT CONTENT. MiniCPM5's template tells the model
++// verbatim: "If it contains <, & or newline characters, wrap it in a CDATA block:
++// <param name="param-name"><![CDATA[...multi-line value...]]></param>" -- so every source file an
++// agent writes arrives wrapped, and handing `<![CDATA[def main():...]]>` to a write tool puts
++// those characters into the file.
++//
++// THE TWO ENDS ARE STRIPPED INDEPENDENTLY, AND THAT IS THE WHOLE POINT. A streamed value is
++// parsed again from the top on every chunk, and what the server sends the client is the part
++// that is new -- so a value already emitted cannot be taken back. Requiring both delimiters
++// before removing either means the opener escapes in the first chunk, every time, and the
++// closing `]]>` is then half-eaten by the suffix match: the agent's files came out starting
++// `<![CDATA[` and ending `]]`, the model saw its own output corrupted, and it spent the rest of
++// the session trying to edit the markers back out.
++//
++// While a value is still partial, a trailing `]` or `]]` is held back: it is either the start of
++// the closer or the end of a JSON array, and withholding is safe either way -- what is emitted
++// stays a prefix of the finished value, which is the contract the streaming diff needs.
++static void unwrap_cdata(std::string_view & sv, bool is_partial) {
++    static constexpr std::string_view cd_open  = "<![CDATA[";
++    static constexpr std::string_view cd_close = "]]>";
++    if (sv.size() < cd_open.size()) {
++        /* Not enough of it to tell yet. While the value is still arriving, anything that could
++         * still BECOME the opener is held back whole -- `<![CDATA` went out as content once and
++         * could never be taken back. A complete value this short is just a short value. */
++        if (is_partial && !sv.empty() && cd_open.compare(0, sv.size(), sv) == 0) {
++            sv = std::string_view();
++        }
++        return;
++    }
++    if (sv.compare(0, cd_open.size(), cd_open) != 0) {
++        return;
++    }
++    sv.remove_prefix(cd_open.size());
++    if (sv.size() >= cd_close.size() &&
++        sv.compare(sv.size() - cd_close.size(), cd_close.size(), cd_close) == 0) {
++        sv.remove_suffix(cd_close.size());
++        return;
++    }
++    if (!is_partial) {
++        return;
++    }
++    size_t hold = 0;
++    while (hold + 1 < cd_close.size() && sv.size() > hold && sv[sv.size() - 1 - hold] == ']') {
++        ++hold;
++    }
++    sv.remove_suffix(hold);
++}
++
+ static std::string_view strip_one_trailing_newline(std::string_view sv) {
+     if (!sv.empty() && sv.back() == '\n') {
+         sv.remove_suffix(1);
+@@ -363,8 +411,10 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
+     }
+ 
+     if ((is_arg_value || is_arg_string_value) && current_tool) {
+-        std::string value_content =
+-            std::string(strip_one_trailing_newline(strip_one_leading_newline(node.text)));
++        std::string_view value_view =
++            strip_one_trailing_newline(strip_one_leading_newline(node.text));
++        unwrap_cdata(value_view, node.is_partial);
++        std::string value_content = std::string(value_view);
+ 
+         std::string value_to_add;
+         if (value_content.empty() && is_arg_string_value) {

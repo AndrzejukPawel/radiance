@@ -1,0 +1,7 @@
+# The image is normally built from `git archive` (docker/build.sh), which carries none of these;
+# this keeps a `docker build .` from a working tree just as clean.
+build*
+.git
+.claude
+**/*.rad
+compile_commands.json

@@ -1,0 +1,33 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index ef15169..1398152 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -2354,8 +2354,26 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+     params.grammar               = inputs.grammar;
+     params.now                   = inputs.now;
+     params.add_generation_prompt = inputs.add_generation_prompt;
+-    params.add_bos               = tmpls->add_bos;
+-    params.add_eos               = tmpls->add_eos;
++    /* RADIANCE: `add_bos` HAS TO COME FROM THE INPUTS, OR THE INPUT FIELD IS DEAD.
++     *
++     * `common_chat_templates_inputs` carries add_bos/add_eos and every caller fills them, but
++     * this conversion overwrote both from the TEMPLATES object -- which is only ever set inside
++     * common_chat_templates_init, from a llama_vocab. A host that passes `model = nullptr` and
++     * supplies the vocabulary's facts as overrides (which is what radiance does: the container
++     * carries the template, the BOS/EOS spellings and the add flags, so there is no llama_model
++     * to read them off) therefore had both flags stuck at false no matter what it asked for.
++     *
++     * What the flag does is strip a BOS the TEMPLATE rendered, because the tokeniser is about to
++     * add one -- so with it stuck off, a container whose tokeniser adds BOS and whose template
++     * also writes `bos_token` gets TWO. The Llama-family templates write it; Qwen's do not,
++     * which is why this stayed invisible here.
++     *
++     * The two upstream callers that do set it -- common_chat_format_single and
++     * common_chat_format_example -- assign `inputs.add_bos = tmpls->add_bos` immediately before
++     * calling apply, which is exactly the redundancy you would expect if apply were meant to read
++     * the inputs. Falling back to the templates object keeps them working unchanged. */
++    params.add_bos               = inputs.add_bos || tmpls->add_bos;
++    params.add_eos               = inputs.add_eos || tmpls->add_eos;
+ 
+     params.continue_final_message = inputs.continue_final_message;
+     if (params.continue_final_message != COMMON_CHAT_CONTINUATION_NONE) {

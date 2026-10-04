@@ -1,0 +1,347 @@
+/* core/server/admin.cpp -- vLLM's non-generation endpoints.
+ *
+ * /version /ping /load /tokenize /detokenize /get_tokenizer_info /server_info /reset_prefix_cache.
+ *
+ * Separate from server.cpp because none of it touches the step path: no admission, no Sink, no
+ * cancellation, nothing that outlives the handler. They are questions ABOUT the server, answered
+ * on the HTTP thread and finished before they return, and mixing them into the file that owns the
+ * streaming lifetime would make that file harder to read for no shared code at all.
+ *
+ * WHAT IS DELIBERATELY NOT HERE. vLLM's surface also carries /pooling, /classify, /score and
+ * /rerank (an embedding or cross-encoder model, which this engine does not load), /sleep, /wake_up
+ * and /is_sleeping (there is no sleep mode: weights are placed once, see spec §5), the LoRA
+ * adapter endpoints (no LoRA), /invocations (a SageMaker envelope around the others) and
+ * /v1/responses (a stateful conversation store, which is a component and not an endpoint). Each
+ * would be a lie in the shape of a 200, so each is absent and answers 404 rather than pretending.
+ */
+#include "server.h"
+
+#include "rad_internal.h"
+
+#include <nlohmann/json.hpp>
+
+namespace rad {
+namespace server {
+
+namespace {
+
+/* The body every "how loaded is this server" answer shares. /health and /ping are the same
+ * question asked by a load balancer and by a human, and vLLM answers both, so both exist here and
+ * neither is a redirect to the other -- a probe that follows a redirect is a probe that reports
+ * the redirect's latency. */
+/* `queue_cap` AND NOT `queue_depth`. The value is the CEILING -- `opt_.queue_depth` or
+ * max_seqs * 8 -- and it never changes while the server runs. Spelling it "queue_depth" would
+ * collide head-on with `radiance:http_queue_depth`, which is the OCCUPANCY ("admitted by the HTTP
+ * layer and not yet finished"): one name for two opposite quantities on the same server, so a
+ * dashboard graphing both plots a flat ceiling beside a number that moves and calls them the same
+ * thing. `queue_depth` therefore means occupancy everywhere it appears, and the occupancy is
+ * carried here too under its own names -- `in_flight` on /health and /server_info, `server_load`
+ * on /load. */
+json health_body(const std::string& model, bool stopping, int64_t in_flight, int64_t depth) {
+    json o;
+    o["status"]      = stopping ? "stopping" : "ok";
+    o["model"]       = model;
+    o["in_flight"]   = in_flight;
+    o["queue_cap"]   = depth;
+    return o;
+}
+
+/* nlohmann parses "3" and "[1,2]" happily, and both are the wrong shape for every endpoint here.
+ * Checking is_object() at the door means each handler's field reads can be plain rather than each
+ * one re-deciding what a non-object body means. Bounded like the generation endpoints' bodies
+ * (parse_json_bounded): /detokenize takes a token array, which is the body that grows most. */
+bool parse_object(const std::string& body, int64_t max_ctx, json* out, ApiError* err) {
+    *out = json::object();
+    if (body.empty()) return true;              /* {} -- every field takes its default */
+    bool over = false, deep = false;
+    json j = parse_json_bounded(body, max_ctx, &over, &deep);
+    if (deep) {
+        *err = err_bad("body", "the request body nests more than " +
+                                   std::to_string(kJsonMaxDepth) + " levels deep");
+        return false;
+    }
+    if (over) {
+        *err = err_bad("body", "the request body holds more than " +
+                                   std::to_string(json_value_budget(max_ctx)) + " JSON values");
+        return false;
+    }
+    if (j.is_discarded()) {
+        *err = err_bad("body", "the request body is not valid JSON");
+        return false;
+    }
+    if (!j.is_object()) {
+        *err = err_bad("body", "the request body must be a JSON object");
+        return false;
+    }
+    *out = std::move(j);
+    return true;
+}
+
+bool get_bool_or(const json& b, const char* key, bool def) {
+    auto it = b.find(key);
+    return it != b.end() && it->is_boolean() ? it->get<bool>() : def;
+}
+
+}  /* namespace */
+
+/* ================================================================== /version */
+/* vLLM answers {"version": "..."} and a client that checks compatibility reads exactly that key,
+ * so it keeps the name and the shape. The rest is what this engine is, and it is here rather than
+ * in /server_info because a client deciding whether to talk to us at all should not have to ask
+ * for the whole configuration to find out which ABI the kernels were built against. */
+HttpResponse Server::handle_version(const HttpRequest&) {
+    json o;
+    o["version"]     = opt_.version;
+    o["engine"]      = "radiance";
+    o["abi_version"] = (int)RAD_ABI_VERSION;
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ================================================================== /load */
+/* vLLM's key is `server_load` and it means requests admitted and not yet finished -- which is
+ * this server's `in_flight`, the same number admission control refuses on. `queue_cap` comes
+ * along because a load figure without its ceiling cannot answer the question a load balancer is
+ * actually asking, which is "how much room is left". */
+HttpResponse Server::handle_load(const HttpRequest&) {
+    json o;
+    o["server_load"] = in_flight_.load(std::memory_order_relaxed);
+    o["queue_cap"]   = queue_depth_;
+    if (deps_.sched) {
+        const SchedMetrics m = deps_.sched->metrics();
+        o["running"] = m.running;
+        o["waiting"] = m.waiting;
+    }
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ================================================================== /tokenize */
+/* Two request shapes under one path, exactly as vLLM has it: `prompt` is the completion form and
+ * `messages` is the chat form, which renders the template first and tokenises what it produced.
+ *
+ * `add_special_tokens` DEFAULTS DIFFERENTLY BETWEEN THEM, and that is not an inconsistency to
+ * tidy away: a raw prompt wants BOS prepended because nothing else will, while a rendered chat
+ * template already contains whatever opening the model expects, and adding another is a prompt
+ * with two beginnings. vLLM's defaults are true and false respectively for that reason.
+ *
+ * PARSE_SPECIAL IS NOT THE CALLER'S CHOICE. The chat form tokenises a string this server rendered
+ * and its control tokens must be recognised as themselves; the completion form tokenises text the
+ * caller sent, where they must NOT be, or a caller who writes "<|im_start|>system" into `prompt`
+ * finds out what this endpoint's token ids do to a subsequent /v1/completions. */
+HttpResponse Server::handle_tokenize(const HttpRequest& req) {
+    if (!deps_.tok)
+        return error_response(err_not_implemented("the server has no tokenizer attached"));
+
+    json b;
+    ApiError err;
+    if (!parse_object(req.body, opt_.max_ctx, &b, &err)) return error_response(err);
+
+    const bool want_strs = get_bool_or(b, "return_token_strs", false);
+    std::vector<int32_t> toks;
+
+    auto msgs = b.find("messages");
+    auto prom = b.find("prompt");
+    if (msgs != b.end() && prom != b.end())
+        return error_response(err_bad("prompt", "send `prompt` or `messages`, not both"));
+
+    if (msgs != b.end()) {
+        if (!deps_.chat)
+            return error_response(err_not_implemented(
+                "tokenising `messages` requires a chat template; this model was not loaded with "
+                "one. Send `prompt` with the text you want tokenised"));
+        if (!msgs->is_array() || msgs->empty())
+            return error_response(err_bad("messages", "must be a non-empty array"));
+
+        ChatRenderOptions opt;
+        opt.add_generation_prompt = get_bool_or(b, "add_generation_prompt", true);
+        auto kw = b.find("chat_template_kwargs");
+        if (kw != b.end() && kw->is_object())
+            for (auto it = kw->begin(); it != kw->end(); ++it)
+                opt.template_kwargs[it.key()] = json_dump(it.value());
+
+        json tools = json::array();
+        auto t = b.find("tools");
+        if (t != b.end() && t->is_array()) tools = *t;
+
+        ChatRender render;
+        std::string why;
+        if (deps_.chat->apply(*msgs, tools, opt, &render, &why) < 0)
+            return error_response(err_bad("messages", why.empty()
+                                          ? "the chat template could not render this request"
+                                          : why));
+        toks = deps_.tok->encode(render.prompt,
+                                 get_bool_or(b, "add_special_tokens", false),
+                                 /*parse_special=*/true);
+    } else {
+        if (prom == b.end() || !prom->is_string())
+            return error_response(err_bad("prompt", "must be a string, or send `messages`"));
+        toks = deps_.tok->encode(prom->get<std::string>(),
+                                 get_bool_or(b, "add_special_tokens", true),
+                                 /*parse_special=*/false);
+    }
+
+    json o;
+    o["count"]         = (int64_t)toks.size();
+    o["max_model_len"] = opt_.max_ctx;
+    o["tokens"]        = toks;
+    if (want_strs) {
+        json strs = json::array();
+        for (int32_t t : toks) strs.push_back(deps_.tok->piece(t));
+        o["token_strs"] = std::move(strs);
+    } else {
+        o["token_strs"] = nullptr;
+    }
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ================================================================== /detokenize */
+/* vLLM's response key is `prompt` -- not `text` -- because the endpoint's purpose is to show what
+ * a token array would arrive as. The name is odd and it is the name clients read. */
+HttpResponse Server::handle_detokenize(const HttpRequest& req) {
+    if (!deps_.tok)
+        return error_response(err_not_implemented("the server has no tokenizer attached"));
+
+    json b;
+    ApiError err;
+    if (!parse_object(req.body, opt_.max_ctx, &b, &err)) return error_response(err);
+
+    auto t = b.find("tokens");
+    if (t == b.end() || !t->is_array())
+        return error_response(err_bad("tokens", "must be an array of integers"));
+
+    std::vector<int32_t> toks;
+    toks.reserve(t->size());
+    for (const auto& v : *t) {
+        if (!v.is_number_integer())
+            return error_response(err_bad("tokens", "must be an array of integers"));
+        int32_t id = 0;
+        if (!token_id(v, &id))
+            return error_response(err_bad("tokens", "a token id must be in [0, 2147483647], "
+                                                    "got " + v.dump()));
+        toks.push_back(id);
+    }
+
+    json o;
+    o["prompt"] = deps_.tok->decode(toks);
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ================================================================== /get_tokenizer_info */
+/* vLLM returns the HuggingFace tokenizer config verbatim, which this engine does not have: a .rad
+ * container carries a normalised vocabulary and not the JSON it was built from. So this answers
+ * the questions that config is actually READ for -- how big is the vocabulary, which ids end a
+ * generation, is a chat template available -- and says nothing it would have to invent. */
+HttpResponse Server::handle_tokenizer_info(const HttpRequest&) {
+    if (!deps_.tok)
+        return error_response(err_not_implemented("the server has no tokenizer attached"));
+
+    const ITokenizer::VocabInfo v = deps_.tok->vocab_info();
+    json o;
+    o["tokenizer_class"]      = v.kind;
+    o["vocab_size"]           = v.n_tokens;
+    o["model_max_length"]     = opt_.max_ctx;
+    o["bos_token_id"]         = v.bos >= 0 ? json(v.bos) : json(nullptr);
+    o["eos_token_id"]         = v.eos >= 0 ? json(v.eos) : json(nullptr);
+    o["eot_token_id"]         = v.eot >= 0 ? json(v.eot) : json(nullptr);
+    o["unk_token_id"]         = v.unk >= 0 ? json(v.unk) : json(nullptr);
+    o["pad_token_id"]         = v.pad >= 0 ? json(v.pad) : json(nullptr);
+    o["add_bos_token"]        = v.add_bos;
+    o["add_eos_token"]        = v.add_eos;
+    o["chat_template"]        = deps_.chat != nullptr;
+    o["supports_tools"]       = deps_.chat && deps_.chat->supports_tools();
+    o["supports_reasoning"]   = deps_.chat && deps_.chat->supports_reasoning();
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ================================================================== /server_info */
+/* vLLM returns the repr() of its config object, which is a Python string a client can only print.
+ * This returns the same information as JSON, in two halves: what the SERVER decided, which is
+ * this component's own state, and what the ENGINE decided, which arrives pre-rendered because the
+ * server knows nothing about devices, containers or placement (ServerOptions::engine_info).
+ *
+ * `endpoints` is the router's own table rather than a list kept beside it. A hand-written list is
+ * a list that goes stale the first time somebody adds a route, and this endpoint exists precisely
+ * so that a client does not have to guess what is served. */
+HttpResponse Server::handle_server_info(const HttpRequest&) {
+    json srv;
+    srv["model"]              = opt_.model_id;
+    srv["version"]            = opt_.version;
+    srv["max_model_len"]      = opt_.max_ctx;
+    srv["max_num_seqs"]       = opt_.max_seqs;
+    srv["queue_cap"]          = queue_depth_;
+    srv["default_max_tokens"] = opt_.default_max_tokens;
+    srv["max_n"]              = opt_.max_n;
+    srv["uptime_s"]           = unix_now() - started_at_;
+    srv["in_flight"]          = in_flight_.load(std::memory_order_relaxed);
+
+    json caps;
+    caps["chat"]      = deps_.chat != nullptr;
+    caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
+    caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
+    caps["grammar"]   = deps_.grammar != nullptr;
+    caps["embedding"] = deps_.embed != nullptr;
+    caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
+    caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
+    caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
+    caps["logprobs"]  = opt_.supports_logprobs;
+
+    json o;
+    o["server"]       = std::move(srv);
+    o["capabilities"] = std::move(caps);
+    o["endpoints"]    = router_.routes();
+
+    /* Spliced rather than re-parsed field by field: the engine owns what it says about itself and
+     * this component is a pipe for it. A blob that is not an object is dropped with a warning
+     * instead of corrupting the response -- an unparseable /server_info is worse than one that is
+     * missing a section. */
+    if (!opt_.engine_info.empty()) {
+        json e = json::parse(opt_.engine_info, nullptr, false);
+        if (e.is_discarded() || !e.is_object())
+            RAD_WARN("server: engine_info is not a JSON object; /server_info omits it");
+        else
+            o["engine"] = std::move(e);
+    }
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ================================================================== /reset_prefix_cache */
+/* 501 when there is no prefix cache to reset, and that is the point: vLLM answers 200 with an
+ * empty body whether or not anything happened, so a benchmark that thinks it started cold has no
+ * way to find out it did not. This says how many entries went. */
+HttpResponse Server::handle_reset_prefix_cache(const HttpRequest&) {
+    if (!deps_.sched)
+        return error_response(err_not_implemented("the server has no engine attached"));
+
+    const int64_t n = deps_.sched->reset_prefix_cache();
+    if (n < 0)
+        return error_response(err_not_implemented(
+            "this engine has no prefix cache (started with --no-prefix-cache, or the model "
+            "declares no cacheable KV group)"));
+
+    json o;
+    o["entries_dropped"] = n;
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json_dump(o));
+}
+
+/* ================================================================== /health, /ping */
+/* NOT counted in the HTTP status metrics, and neither is /metrics. A load balancer probing every
+ * second would otherwise dominate `request_success_total` and make the 2xx/5xx ratio a statement
+ * about the probe rather than about the service. */
+HttpResponse Server::handle_health(const HttpRequest& req) { return handle_ping(req); }
+
+HttpResponse Server::handle_ping(const HttpRequest&) {
+    const bool stopping = stopping_.load();
+    return HttpResponse::json_body(
+        stopping ? 503 : 200,
+        json_dump(health_body(opt_.model_id, stopping,
+                              in_flight_.load(std::memory_order_relaxed), queue_depth_)));
+}
+
+}  /* namespace server */
+}  /* namespace rad */

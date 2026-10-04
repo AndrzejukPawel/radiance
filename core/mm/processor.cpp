@@ -1,0 +1,549 @@
+/* processor.cpp -- see processor.h. */
+#include "mm/processor.h"
+
+#include "rad_internal.h"
+#include "rad_plugin.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <sstream>
+
+namespace rad {
+namespace mm {
+
+/* ================================================================== configuration */
+
+static bool read_triple(const RadModelMeta& m, const char* key, float out[3]) {
+    const char* v = rad_meta_gets(&m, key, nullptr);
+    if (!v || !*v) return false;
+    std::istringstream is(v);
+    float t[3];
+    for (int i = 0; i < 3; ++i)
+        if (!(is >> t[i])) return false;
+    for (int i = 0; i < 3; ++i) out[i] = t[i];
+    return true;
+}
+
+int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
+    patch    = (int32_t)rad_meta_geti(&m, "vision_config.patch_size", 0);
+    temporal = (int32_t)rad_meta_geti(&m, "vision_config.temporal_patch_size", 0);
+    merge    = (int32_t)rad_meta_geti(&m, "vision_config.spatial_merge_size", 0);
+    if (patch <= 0 || temporal <= 0 || merge <= 0) {
+        if (why) *why = "the container states no vision tower geometry (vision_config.patch_size, "
+                        "temporal_patch_size, spatial_merge_size)";
+        return RAD_E_NOTFOUND;
+    }
+    tok_image = (int32_t)rad_meta_geti(&m, "image_token_id", -1);
+    tok_video = (int32_t)rad_meta_geti(&m, "video_token_id", -1);
+    tok_start = (int32_t)rad_meta_geti(&m, "vision_start_token_id", -1);
+    tok_end   = (int32_t)rad_meta_geti(&m, "vision_end_token_id", -1);
+    if (tok_image < 0 || tok_video < 0 || tok_start < 0 || tok_end < 0) {
+        if (why) *why = "the container states no media token ids (image_token_id, video_token_id, "
+                        "vision_start_token_id, vision_end_token_id)";
+        return RAD_E_NOTFOUND;
+    }
+    /* THE PROCESSOR-ONLY KEYS DEFAULT TO THE FAMILY'S VALUES. They come from the checkpoint's
+     * preprocessor configs, which a container may not carry; the numbers below are what the
+     * Qwen3.x checkpoints ship. */
+    image_min_pixels = rad_meta_geti(&m, "preprocessor.size.shortest_edge",
+                                     rad_meta_geti(&m, "preprocessor.min_pixels", 65536));
+    image_max_pixels = rad_meta_geti(&m, "preprocessor.size.longest_edge",
+                                     rad_meta_geti(&m, "preprocessor.max_pixels", 16777216));
+    video_min_pixels = rad_meta_geti(&m, "video_preprocessor.size.shortest_edge", 4096);
+    video_max_pixels = rad_meta_geti(&m, "video_preprocessor.size.longest_edge", 25165824);
+    fps        = rad_meta_getf(&m, "video_preprocessor.fps", 2.0);
+    min_frames = (int32_t)rad_meta_geti(&m, "video_preprocessor.min_frames", 4);
+    max_frames = (int32_t)rad_meta_geti(&m, "video_preprocessor.max_frames", 768);
+    max_frame_rows = (int32_t)rad_meta_geti(&m, "video_preprocessor.max_video_tokens", 768);
+    read_triple(m, "preprocessor.image_mean", mean);
+    read_triple(m, "preprocessor.image_std", stdv);
+    if (image_min_pixels <= 0 || image_max_pixels < image_min_pixels || video_min_pixels <= 0 ||
+        video_max_pixels < video_min_pixels || !(fps > 0.0) || min_frames < 1 ||
+        max_frames < min_frames) {
+        if (why) *why = "the container's preprocessor configuration is inconsistent";
+        return RAD_E_INVAL;
+    }
+    for (int c = 0; c < 3; ++c)
+        if (!(stdv[c] > 0.0f)) {
+            if (why) *why = "preprocessor.image_std must be positive";
+            return RAD_E_INVAL;
+        }
+    return RAD_OK;
+}
+
+/* ================================================================== sizes and sampling */
+
+/* Python's round(), which is round-half-to-even on the double -- the reference computes these in
+ * Python, and a size that lands on .5 rounds the way it does there. */
+static inline int64_t pyround(double x) { return (int64_t)std::nearbyint(x); }
+
+int smart_resize_image(int64_t h, int64_t w, int32_t factor, int64_t min_px, int64_t max_px,
+                       int64_t* oh, int64_t* ow, std::string* why) {
+    if (h <= 0 || w <= 0) { if (why) *why = "the picture has no size"; return RAD_E_INVAL; }
+    if ((double)std::max(h, w) / (double)std::min(h, w) > 200.0) {
+        if (why) *why = "the picture's aspect ratio is over 200:1";
+        return RAD_E_INVAL;
+    }
+    const double f = factor;
+    int64_t hb = pyround((double)h / f) * factor;
+    int64_t wb = pyround((double)w / f) * factor;
+    if (hb * wb > max_px) {
+        const double beta = std::sqrt((double)(h * w) / (double)max_px);
+        hb = std::max<int64_t>(factor, (int64_t)std::floor((double)h / beta / f) * factor);
+        wb = std::max<int64_t>(factor, (int64_t)std::floor((double)w / beta / f) * factor);
+    } else if (hb * wb < min_px) {
+        const double beta = std::sqrt((double)min_px / (double)(h * w));
+        hb = (int64_t)std::ceil((double)h * beta / f) * factor;
+        wb = (int64_t)std::ceil((double)w * beta / f) * factor;
+    }
+    *oh = hb;
+    *ow = wb;
+    return RAD_OK;
+}
+
+int smart_resize_video(int64_t t, int64_t h, int64_t w, int32_t tfactor, int32_t factor,
+                       int64_t min_px, int64_t max_px, int64_t* oh, int64_t* ow, std::string* why) {
+    if (t < tfactor) { if (why) *why = "too few frames"; return RAD_E_INVAL; }
+    if (h < factor || w < factor) {
+        const double s = std::max((double)factor / (double)h, (double)factor / (double)w);
+        h = (int64_t)((double)h * s);
+        w = (int64_t)((double)w * s);
+    }
+    if (h <= 0 || w <= 0) { if (why) *why = "the video has no size"; return RAD_E_INVAL; }
+    if ((double)std::max(h, w) / (double)std::min(h, w) > 200.0) {
+        if (why) *why = "the video's aspect ratio is over 200:1";
+        return RAD_E_INVAL;
+    }
+    const double f = factor;
+    int64_t hb = pyround((double)h / f) * factor;
+    int64_t wb = pyround((double)w / f) * factor;
+    const int64_t tb = pyround((double)t / (double)tfactor) * tfactor;
+    if (tb * hb * wb > max_px) {
+        const double beta = std::sqrt((double)(t * h * w) / (double)max_px);
+        hb = std::max<int64_t>(factor, (int64_t)std::floor((double)h / beta / f) * factor);
+        wb = std::max<int64_t>(factor, (int64_t)std::floor((double)w / beta / f) * factor);
+    } else if (tb * hb * wb < min_px) {
+        const double beta = std::sqrt((double)min_px / (double)(t * h * w));
+        hb = (int64_t)std::ceil((double)h * beta / f) * factor;
+        wb = (int64_t)std::ceil((double)w * beta / f) * factor;
+    }
+    *oh = hb;
+    *ow = wb;
+    return RAD_OK;
+}
+
+/* THE REFERENCE'S FRAME CHOICE: as many frames as `fps` gives over the clip's duration, clamped to
+ * [min_frames, max_frames] and to what the stream has, spread evenly over it -- numpy's linspace,
+ * rounded half-to-even. A stream that states no rate is taken at 24, as the reference does. */
+std::vector<int64_t> sample_frames(const VideoInfo& info, double fps, int32_t min_frames,
+                                   int32_t max_frames) {
+    const int64_t total = info.n_frames;
+    if (total <= 0) return {};
+    const double vfps = info.fps > 0.0 ? info.fps : 24.0;
+    int64_t n = (int64_t)((double)total / vfps * fps);
+    n = std::min<int64_t>(std::max<int64_t>(n, min_frames), max_frames);
+    n = std::min<int64_t>(n, total);
+    std::vector<int64_t> idx((size_t)n);
+    if (n == 1) { idx[0] = 0; return idx; }
+    const double step = (double)(total - 1) / (double)(n - 1);
+    for (int64_t i = 0; i < n; ++i) idx[(size_t)i] = (int64_t)std::nearbyint((double)i * step);
+    idx[(size_t)n - 1] = total - 1;
+    return idx;
+}
+
+/* ================================================================== the resample
+ *
+ * Pillow's ImagingResample for an 8-bit RGB image, transcribed: the coefficient table in double,
+ * normalised per output pixel and rounded to 22-bit fixed point; a horizontal pass over only the
+ * source rows the vertical pass will read, into an 8-bit intermediate; then the vertical pass. The
+ * rounding at the intermediate is part of the function -- a single-pass float resample is a
+ * different (and slightly better) function, and not the one the model was trained against. */
+namespace {
+
+constexpr int kPrec = 32 - 8 - 2;
+
+inline double bicubic(double x) {
+    constexpr double a = -0.5;
+    if (x < 0.0) x = -x;
+    if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+    return 0.0;
+}
+
+inline uint8_t clip8(int32_t v) {
+    const int32_t s = v >> kPrec;
+    return (uint8_t)(s < 0 ? 0 : (s > 255 ? 255 : s));
+}
+
+/* One axis: `bounds` gets (first, count) per output pixel and `kk` its fixed-point weights, `ksize`
+ * a row. */
+int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
+           std::vector<int32_t>* kk) {
+    const double scale = (double)in_size / (double)out_size;
+    const double fscale = scale < 1.0 ? 1.0 : scale;
+    const double support = 2.0 * fscale;
+    const int ksize = (int)std::ceil(support) * 2 + 1;
+    std::vector<double> k((size_t)ksize);
+    bounds->assign((size_t)out_size * 2, 0);
+    kk->assign((size_t)out_size * (size_t)ksize, 0);
+    for (int xx = 0; xx < out_size; ++xx) {
+        const double center = (xx + 0.5) * scale;
+        const double ss = 1.0 / fscale;
+        int xmin = (int)(center - support + 0.5);
+        if (xmin < 0) xmin = 0;
+        int xmax = (int)(center + support + 0.5);
+        if (xmax > in_size) xmax = in_size;
+        xmax -= xmin;
+        double ww = 0.0;
+        int x = 0;
+        for (; x < xmax; ++x) {
+            const double w = bicubic((x + xmin - center + 0.5) * ss);
+            k[(size_t)x] = w;
+            ww += w;
+        }
+        for (x = 0; x < xmax; ++x)
+            if (ww != 0.0) k[(size_t)x] /= ww;
+        for (; x < ksize; ++x) k[(size_t)x] = 0.0;
+        for (x = 0; x < ksize; ++x) {
+            const double v = k[(size_t)x];
+            (*kk)[(size_t)xx * ksize + x] = v < 0 ? (int32_t)(-0.5 + v * (1 << kPrec))
+                                                  : (int32_t)(0.5 + v * (1 << kPrec));
+        }
+        (*bounds)[(size_t)xx * 2]     = xmin;
+        (*bounds)[(size_t)xx * 2 + 1] = xmax;
+    }
+    return ksize;
+}
+
+}  /* namespace */
+
+void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
+    if (in.w == w && in.h == h) { *out = in; return; }
+    std::vector<int32_t> bh, kh, bv, kv;
+    const int ksh = coeffs(in.w, w, &bh, &kh);
+    const int ksv = coeffs(in.h, h, &bv, &kv);
+
+    /* The source rows the vertical pass reads, which is all the horizontal pass has to produce. */
+    const int y_first = bv[0];
+    const int y_last = bv[(size_t)h * 2 - 2] + bv[(size_t)h * 2 - 1];
+    const bool need_h = w != in.w;
+    const bool need_v = h != in.h;
+
+    Frame tmp;
+    const Frame* src = &in;
+    if (need_h) {
+        const int rows = need_v ? y_last - y_first : in.h;
+        const int y0 = need_v ? y_first : 0;
+        tmp.w = w;
+        tmp.h = rows;
+        tmp.rgb.assign((size_t)w * rows * 3, 0);
+        for (int yy = 0; yy < rows; ++yy) {
+            const uint8_t* row = in.rgb.data() + (size_t)(yy + y0) * in.w * 3;
+            uint8_t* o = tmp.rgb.data() + (size_t)yy * w * 3;
+            for (int xx = 0; xx < w; ++xx) {
+                const int xmin = bh[(size_t)xx * 2], xmax = bh[(size_t)xx * 2 + 1];
+                const int32_t* k = kh.data() + (size_t)xx * ksh;
+                int32_t s0 = 1 << (kPrec - 1), s1 = s0, s2 = s0;
+                for (int x = 0; x < xmax; ++x) {
+                    const uint8_t* p = row + (size_t)(x + xmin) * 3;
+                    s0 += p[0] * k[x];
+                    s1 += p[1] * k[x];
+                    s2 += p[2] * k[x];
+                }
+                o[xx * 3 + 0] = clip8(s0);
+                o[xx * 3 + 1] = clip8(s1);
+                o[xx * 3 + 2] = clip8(s2);
+            }
+        }
+        src = &tmp;
+    }
+    if (!need_v) { *out = std::move(tmp); return; }
+    const int shift = need_h ? y_first : 0;
+    out->w = src->w;
+    out->h = h;
+    out->rgb.assign((size_t)src->w * h * 3, 0);
+    for (int yy = 0; yy < h; ++yy) {
+        const int ymin = bv[(size_t)yy * 2] - shift, ymax = bv[(size_t)yy * 2 + 1];
+        const int32_t* k = kv.data() + (size_t)yy * ksv;
+        uint8_t* o = out->rgb.data() + (size_t)yy * src->w * 3;
+        for (int xx = 0; xx < src->w; ++xx) {
+            int32_t s0 = 1 << (kPrec - 1), s1 = s0, s2 = s0;
+            for (int y = 0; y < ymax; ++y) {
+                const uint8_t* p = src->rgb.data() + ((size_t)(y + ymin) * src->w + xx) * 3;
+                s0 += p[0] * k[y];
+                s1 += p[1] * k[y];
+                s2 += p[2] * k[y];
+            }
+            o[xx * 3 + 0] = clip8(s0);
+            o[xx * 3 + 1] = clip8(s1);
+            o[xx * 3 + 2] = clip8(s2);
+        }
+    }
+}
+
+/* ================================================================== patches */
+
+namespace {
+
+inline uint64_t mix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+
+/* Two independent 64-bit lanes over the patch bytes and the grid. The prefix cache folds the key
+ * into a chained 128-bit block identity; a collision would serve one picture's cache for another,
+ * so both lanes are carried. */
+void content_key(const Item& it, uint64_t* hi, uint64_t* lo) {
+    uint64_t a = 0x6a09e667f3bcc908ull ^ mix64((uint64_t)it.grid_t << 42 ^
+                                               (uint64_t)it.grid_h << 21 ^ (uint64_t)it.grid_w);
+    uint64_t b = 0xbb67ae8584caa73bull ^ mix64(it.kind == Kind::Image ? 1u : 2u);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(it.pixels.data());
+    const size_t n = it.pixels.size() * sizeof(uint16_t);
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        uint64_t w0, w1;
+        std::memcpy(&w0, p + i, 8);
+        std::memcpy(&w1, p + i + 8, 8);
+        a = mix64(a ^ w0) + w1;
+        b = mix64(b ^ w1) ^ w0;
+    }
+    for (; i < n; ++i) { a = mix64(a ^ p[i]); b = mix64(b + p[i]); }
+    *hi = mix64(a ^ (uint64_t)n);
+    *lo = mix64(b + (uint64_t)n);
+}
+
+/* THE PATCH ROWS, in merge-block order, from `frames` (temporal * grid_t of them, already resized
+ * to grid_h * patch by grid_w * patch). Each row is (channel, frame, y, x), each value normalised
+ * as the reference does -- (x - 255 mean) / (255 std) in f32 -- and rounded to bf16. */
+void patchify(const VisionConfig& c, const std::vector<const Frame*>& frames, Item* it) {
+    const int P = c.patch, T = c.temporal, M = c.merge;
+    const int gh = it->grid_h, gw = it->grid_w;
+    float m255[3], s255[3];
+    for (int ch = 0; ch < 3; ++ch) {
+        /* torch.tensor(mean) * (1 / rescale_factor), in f32: the fused rescale's own constants. */
+        m255[ch] = c.mean[ch] * (float)(1.0 / (1.0 / 255.0));
+        s255[ch] = c.stdv[ch] * (float)(1.0 / (1.0 / 255.0));
+    }
+    /* One lookup per (channel, byte): the normalisation is a function of the byte alone. */
+    uint16_t lut[3][256];
+    for (int ch = 0; ch < 3; ++ch)
+        for (int v = 0; v < 256; ++v)
+            lut[ch][v] = rad_f32_to_bf16(((float)v - m255[ch]) / s255[ch]);
+
+    const int64_t dim = it->patch_dim;
+    it->pixels.assign((size_t)it->n_patch * (size_t)dim, 0);
+    uint16_t* dst = it->pixels.data();
+    for (int g = 0; g < it->grid_t; ++g)
+        for (int bh = 0; bh < gh / M; ++bh)
+            for (int bw = 0; bw < gw / M; ++bw)
+                for (int mh = 0; mh < M; ++mh)
+                    for (int mw = 0; mw < M; ++mw) {
+                        const int py0 = (bh * M + mh) * P, px0 = (bw * M + mw) * P;
+                        for (int ch = 0; ch < 3; ++ch)
+                            for (int t = 0; t < T; ++t) {
+                                const Frame& f = *frames[(size_t)(g * T + t)];
+                                for (int y = 0; y < P; ++y) {
+                                    const uint8_t* row = f.rgb.data() +
+                                        ((size_t)(py0 + y) * f.w + px0) * 3 + ch;
+                                    for (int x = 0; x < P; ++x) *dst++ = lut[ch][row[x * 3]];
+                                }
+                            }
+                    }
+}
+
+void finish_item(const VisionConfig& c, Item* it) {
+    it->patch_dim = c.patch_dim();
+    it->n_patch = (int64_t)it->grid_t * it->grid_h * it->grid_w;
+    it->rows_h = it->grid_h / c.merge;
+    it->rows_w = it->grid_w / c.merge;
+    it->seg_rows = it->rows_h * it->rows_w;
+    it->n_seg = it->grid_t;
+}
+
+}  /* namespace */
+
+/* ================================================================== the processor */
+
+int Processor::init(const VisionConfig& cfg,
+                    std::function<std::vector<int32_t>(const std::string&)> encode_text) {
+    if (cfg.patch <= 0 || cfg.temporal <= 0 || cfg.merge <= 0 || cfg.max_patches <= 0)
+        return RAD_E_INVAL;
+    cfg_ = cfg;
+    /* The largest image the encoder takes in one pass, in pixels: the band's ceiling comes down to
+     * it, so smart_resize itself keeps every image inside a pass. */
+    const int64_t pass_px = cfg.max_patches * cfg.patch * cfg.patch;
+    if (cfg_.image_max_pixels > pass_px) cfg_.image_max_pixels = pass_px;
+    if (cfg_.image_min_pixels > cfg_.image_max_pixels) cfg_.image_min_pixels = cfg_.image_max_pixels;
+    if (cfg_.max_video_patches <= 0)
+        cfg_.max_video_patches = cfg_.video_max_pixels / ((int64_t)cfg.patch * cfg.patch);
+    encode_text_ = std::move(encode_text);
+    return RAD_OK;
+}
+
+int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    int64_t h = 0, w = 0;
+    RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
+                               &h, &w, why));
+    Frame r;
+    resize_bicubic(f, (int32_t)w, (int32_t)h, &r);
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Image;
+    it->grid_t = 1;
+    it->grid_h = (int32_t)(h / c.patch);
+    it->grid_w = (int32_t)(w / c.patch);
+    finish_item(c, it.get());
+    if (it->n_patch > c.max_patches) {
+        if (why) *why = "the image resizes to more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    /* An image fills the temporal depth by repetition. */
+    std::vector<const Frame*> frames((size_t)c.temporal, &r);
+    patchify(c, frames, it.get());
+    content_key(*it, &it->key_hi, &it->key_lo);
+
+    it->expand.reserve((size_t)it->seg_rows + 2);
+    it->expand.push_back(c.tok_start);
+    it->seg_at.push_back(1);
+    it->expand.insert(it->expand.end(), (size_t)it->seg_rows, c.tok_image);
+    it->expand.push_back(c.tok_end);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
+int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const {
+    const VisionConfig& c = cfg_;
+    if (v.frames.empty()) { if (why) *why = "the video decoded to no frames"; return RAD_E_INVAL; }
+    /* The frames and their indices, padded to whole temporal groups by repeating the last. A clip
+     * shorter than one group is padded the same way, so a single-frame video is one group. */
+    std::vector<const Frame*> frames;
+    std::vector<int64_t> idx = v.index;
+    for (const Frame& f : v.frames) frames.push_back(&f);
+    while (frames.size() % (size_t)c.temporal != 0 || frames.size() < (size_t)c.temporal) {
+        frames.push_back(frames.back());
+        idx.push_back(idx.back());
+    }
+    const int64_t nf = (int64_t)v.frames.size() < c.temporal ? c.temporal
+                                                              : (int64_t)v.frames.size();
+
+    /* THE PER-FRAME CAP: at most `max_frame_rows` output rows' worth of pixels a frame, and the
+     * video budget's even share, but never under the band's floor. */
+    int64_t max_px = c.video_max_pixels;
+    if (c.max_frame_rows > 0) {
+        const int64_t f2 = (int64_t)c.factor() * c.factor();
+        const int64_t cap = (int64_t)c.max_frame_rows * f2;
+        const int64_t share = c.video_max_pixels / nf;
+        const int64_t per = std::max<int64_t>(std::min(cap, share),
+                                              (int64_t)((double)c.video_min_pixels * 1.05));
+        max_px = per * nf;
+    }
+    int64_t h = 0, w = 0;
+    RAD_TRY(smart_resize_video(nf, v.frames[0].h, v.frames[0].w, c.temporal, c.factor(),
+                               c.video_min_pixels, max_px, &h, &w, why));
+
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Video;
+    it->grid_t = (int32_t)(frames.size() / (size_t)c.temporal);
+    it->grid_h = (int32_t)(h / c.patch);
+    it->grid_w = (int32_t)(w / c.patch);
+    finish_item(c, it.get());
+    if ((int64_t)it->grid_h * it->grid_w > c.max_patches) {
+        if (why) *why = "a video frame resizes to more patches than one encoder pass holds";
+        return RAD_E_INVAL;
+    }
+    if (it->n_patch > c.max_video_patches) {
+        if (why) *why = "the video is over the server's patch budget for one video";
+        return RAD_E_INVAL;
+    }
+
+    /* Resize each distinct frame once; padding repeats share the resized copy. */
+    std::vector<Frame> resized(v.frames.size());
+    for (size_t i = 0; i < v.frames.size(); ++i)
+        resize_bicubic(v.frames[i], (int32_t)w, (int32_t)h, &resized[i]);
+    std::vector<const Frame*> rframes;
+    for (const Frame* f : frames) rframes.push_back(&resized[(size_t)(f - v.frames.data())]);
+    patchify(c, rframes, it.get());
+    content_key(*it, &it->key_hi, &it->key_lo);
+
+    /* THE TIMESTAMPED EXPANSION: per temporal group, "<T seconds>" then a run of pads between
+     * vision_start and vision_end, T being the mean of the group's first and last frame times.
+     * It stands for the template's whole <|vision_start|><|video_pad|><|vision_end|>, as the
+     * model's own processor wrote it (transformers 4.57, qwen-vl-utils). transformers 5.x swaps
+     * only the pad and leaves that outer pair around the frames -- two tokens the model was not
+     * trained with. */
+    const double vfps = v.info.fps > 0.0 ? v.info.fps : 24.0;
+    for (int32_t g = 0; g < it->grid_t; ++g) {
+        const double t0 = (double)idx[(size_t)g * c.temporal] / vfps;
+        const double t1 = (double)idx[(size_t)g * c.temporal + c.temporal - 1] / vfps;
+        char ts[64];
+        std::snprintf(ts, sizeof ts, "<%.1f seconds>", (t0 + t1) / 2.0);
+        const std::vector<int32_t> tt = encode_text_ ? encode_text_(ts) : std::vector<int32_t>{};
+        if (tt.empty()) {
+            if (why) *why = "the tokenizer produced nothing for a video timestamp";
+            return RAD_E_STATE;
+        }
+        it->expand.insert(it->expand.end(), tt.begin(), tt.end());
+        it->expand.push_back(c.tok_start);
+        it->seg_at.push_back((int32_t)it->expand.size());
+        it->expand.insert(it->expand.end(), (size_t)it->seg_rows, c.tok_video);
+        it->expand.push_back(c.tok_end);
+    }
+    *out = std::move(it);
+    return RAD_OK;
+}
+
+int Processor::image(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
+                     std::string* why) const {
+    Frame f;
+    RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+    return image_from(f, out, why);
+}
+
+namespace {
+struct SampleArgs { double fps; int32_t lo, hi; };
+std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
+    const SampleArgs* a = static_cast<const SampleArgs*>(user);
+    return sample_frames(info, a->fps, a->lo, a->hi);
+}
+}  /* namespace */
+
+int Processor::video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
+                     std::string* why) const {
+    Video v;
+    const SampleArgs a{ cfg_.fps, cfg_.min_frames, cfg_.max_frames };
+    RAD_TRY(decode_video(bytes, n, sample_cb, &a, cfg_.max_source_pixels, &v, why));
+    return video_from(v, out, why);
+}
+
+/* ================================================================== rotary layout */
+
+void PromptMedia::layout() {
+    rope.runs.clear();
+    int64_t pos = 0, tok = 0;
+    for (size_t pi = 0; pi < items.size(); ++pi) {
+        const Placed& p = items[pi];
+        const Item& it = *p.item;
+        for (int32_t s = 0; s < it.n_seg; ++s) {
+            const int64_t run_tok = (int64_t)p.tok + it.seg_at[(size_t)s];
+            pos += run_tok - tok;            /* the text in front of the run counts up */
+            RopeLayout::Run r;
+            r.tok = (int32_t)run_tok;
+            r.n = it.seg_rows;
+            r.w = it.rows_w;
+            r.base = (int32_t)pos;
+            pos += std::max(it.rows_h, it.rows_w);
+            tok = run_tok + it.seg_rows;
+            r.shift = (int32_t)(pos - tok);
+            r.item = (int32_t)pi;
+            r.row0 = s * it.seg_rows;
+            rope.runs.push_back(r);
+        }
+    }
+}
+
+}  /* namespace mm */
+}  /* namespace rad */

@@ -1,0 +1,393 @@
+/* config.cpp -- the command line. Every pool is budgeted explicitly: no profiling pass, no
+ * utilisation fraction, no inference about what the workload will be. The trade between KV blocks
+ * and resident weights is real and workload-dependent -- a long-context low-concurrency server and
+ * a short-context high-concurrency one want opposite splits -- but it is the operator's to make.
+ * An engine that quietly re-optimises the split is an engine whose benchmarks do not reproduce
+ * (spec §6).
+ */
+#include "rad_core.h"
+
+#include <cstdlib>
+#include <cstring>
+
+namespace rad {
+
+struct Flag {
+    const char* name;
+    const char* arg;     /* null for a boolean */
+    const char* help;
+};
+
+static const Flag g_flags[] = {
+    { "--model",              "PATH",   "the .rad container, or a checkpoint served as it stands" },
+    { "--radiance-home",      "DIRS",   "where kernels/, architectures/ and quantizers/ live; several\n"
+                                        "homes separated by ':' are searched in order, the first winning" },
+    { "--kernels",            "LIST",   "kernel plugin hierarchy, comma-separated, first wins" },
+
+    { "--tp",                 "N",      "tensor-parallel ranks" },
+    { "--tp-wire",            "MODE",   "cross-rank all-reduce payload: exact (default) or wht6" },
+    { "--tp-wire-min-kb",     "N",      "smallest all-reduce, in KiB, the wht6 wire is used for" },
+    { "--max-num-batched-tokens", "N",  "the largest token count one step may carry" },
+    { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
+    { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
+
+    { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
+    /* THE FLAG THAT DECIDES WHETHER MULTI-TURN WORKS, which is more than the split it names.
+     * The KV side is not just concurrency: prefix caching holds a finished sequence's blocks
+     * so the next turn can reuse them, so when the pool cannot hold the LIVE SESSIONS the
+     * cache drops prefixes the next turn wanted and that turn re-prefills its whole context.
+     * At long contexts that is two orders of magnitude of time-to-first-token, bought back for
+     * a fraction of a percent of the decode step. See core/mem/prefix.h. */
+    { "--expert-vs-cache-ratio", "R",   "weights vs KV split of what is claimed (default "
+                                          "0.75). The KV side also holds cached prefixes, so "
+                                          "too little of it makes every agent turn re-prefill" },
+    { "--vram-weights-mib",   "N",      "the resident weight slab; 0 derives it from the card" },
+    { "--vram-kv-mib",        "N",      "the paged KV pool; 0 derives it from the card" },
+    { "--kv-cache-dtype",     "T",      "bf16 | fp8 -- fp8 halves what a token of context costs" },
+    { "--host-pool-mib",      "N",      "pinned host tier" },
+    { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
+    "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
+    "                                    at a time, so a step is paced by the drive" },
+    { "--prefix-cache-host-mib", "N",   "copy finished conversations' KV to host memory, up to N MiB,\n"
+    "                                    so their VRAM can go to experts and a return restores\n"
+    "                                    instead of re-prefilling. 0 is off. Part of it holds\n"
+    "                                    linear-state snapshots on a hybrid model; startup says how many" },
+    { "--prefix-cache-dir",   "DIR",    "where the disk tier keeps them. Not --weights-disk-tier, which is\n"
+    "                                    about WEIGHTS" },
+    { "--prefix-cache-disk-mib", "N",   "and copy them on to disk under --prefix-cache-dir, up to N MiB,\n"
+    "                                    so a full host tier gives slots up for nothing. Holds\n"
+    "                                    conversation content unencrypted. 0 is off" },
+
+    { "--placement",          "MODE",   "all_vram | layer_offload | expert_tiered | auto" },
+    { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
+    "                                    set cannot change under the heat engine. The sampler is\n"
+    "                                    already order-independent and needs no pinning; note that\n"
+    "                                    this does NOT make the engine bit-reproducible across\n"
+    "                                    batch positions -- see spec §19" },
+    { "--checkpoint-interval","N",      "linear-attention state checkpoint interval, in tokens" },
+    /* TOTAL, NOT PER SEQUENCE. `ck_free_` is one global free list of N slots handed out by
+     * pop_back (core/mem/kv.cpp), so an operator reading "per sequence" and setting 2 gets
+     * 2 for the whole server rather than 2 x --max-num-seqs. At the default 8 slots and
+     * 8 sequences that is one snapshot a sequence, which is what an append-only chat wants --
+     * the next turn's hit lands at the end of the last one. */
+    { "--checkpoint-slots",   "N",      "linear-state snapshots retained IN TOTAL (not "
+                                          "per sequence); compare against --max-num-seqs" },
+    { "--no-prefix-cache",    nullptr,  "disable prefix caching" },
+    { "--checkpoint-policy",  "NAME",   "which snapshots a session retains: geometric-backoff "
+                                        "(default), tip-only, keep-all" },
+
+    { "--num-speculative-tokens", "N",  "speculative window; 0 disables. Default `auto`: the drafter's\n"
+    "                                    own operating point, which the plugin states. A container\n"
+    "                                    with no draft head is unaffected -- auto resolves to 0." },
+    { "--draft-model",        "PATH",   "NOT IMPLEMENTED -- merge the drafter at convert time" },
+
+    { "--host",               "ADDR",   "listen address" },
+    { "--port",               "N",      "listen port" },
+    { "--api-key",            "KEY",    "require `Authorization: Bearer KEY` on every request but /health, /ping and the dashboard page" },
+    { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
+                                        "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
+                                        "serves text only and keeps the tower off the card" },
+    { "--generation-config",  "PATH",   "a generation_config.json whose sampler settings become the default\n"
+    "                                    for requests that send none. Without it the container's own\n"
+    "                                    `generation.*` metadata is used, then a <model>.generation.json\n"
+    "                                    beside the container, then the built-in defaults" },
+    { "--temp",               "F",      "default temperature for requests that do not set one" },
+    { "--top-k",              "N",      "default top_k (0 = off) for requests that do not set one" },
+    { "--top-p",              "F",      "default top_p for requests that do not set one" },
+    { "--min-p",              "F",      "default min_p (0 = off) for requests that do not set one.\n"
+    "                                    These four override whatever the container or its generation\n"
+    "                                    config asked for; unset, they are resolved from it" },
+    { "--reasoning-effort",   "S",      "default `reasoning_effort` for chat requests that do not set one.\n"
+    "                                    The value goes to the model's chat template verbatim, so the legal\n"
+    "                                    set is the template's: Qwen3.8 takes xhigh|medium|low and defaults\n"
+    "                                    to xhigh, which on a short task can spend the whole token budget\n"
+    "                                    inside <think> and answer nothing. \"none\" turns thinking off" },
+
+    { "--kld-record",         "DIR",    "instead of serving, run --kld-corpus through prefill and write this\n"
+    "                                    model's log-probabilities at every scored position to DIR: the\n"
+    "                                    reference a quantised model is measured against" },
+    { "--kld-ref",            "DIR",    "instead of serving, score this model against the reference in DIR:\n"
+    "                                    mean, median, 99/99.9/99.99th percentile KL divergence and top-1\n"
+    "                                    agreement, over the positions and tokens DIR was recorded at" },
+    { "--kld-corpus",         "FILE",   "JSONL, one {\"prompt\", \"score_from\"?, \"source\"?} a line; --kld-record only" },
+    { "--kld-out",            "FILE",   "the --kld-ref report as JSON, and every position's numbers in FILE.rows" },
+
+    { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
+    { "--debug-selection",    nullptr,  "print the selection table" },
+    { "--debug-placement",    nullptr,  "print the placement plan" },
+    { "--debug-accept-reference-kernels", nullptr,
+      "serve even when ops resolve only to a reference library. NOT a production configuration: the reference\n"
+      "                              implementation is an oracle and a last resort, and falling back\n"
+      "                              to it is orders of magnitude of speed with nothing to say so." },
+    { "--profile-ops",        nullptr,  "per-op device timing (see the caveat it prints)" },
+    { "--live",               nullptr,  "the live view: cards, throughput, draft acceptance, the expert plane.\n"
+    "                                    Redirected it prints one greppable key=value line instead" },
+    { "-v",                   nullptr,  "verbose" },
+    { "-vv",                  nullptr,  "very verbose" },
+    { "--help",               nullptr,  "this" },
+};
+
+void config_usage(const char* argv0) {
+    fprintf(stderr, "usage: %s --model FILE [options]\n\n", argv0);
+    for (const Flag& f : g_flags) {
+        char left[64];
+        snprintf(left, sizeof left, "%s%s%s", f.name, f.arg ? " " : "", f.arg ? f.arg : "");
+        fprintf(stderr, "  %-32s %s\n", left, f.help);
+    }
+    fprintf(stderr,
+        "\nEvery pool is budgeted explicitly. The trade between KV blocks and resident weights\n"
+        "is the operator's to make: an engine that re-optimises it quietly is an engine whose\n"
+        "benchmarks do not reproduce.\n");
+}
+
+static std::vector<std::string> split_commas(const std::string& s) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i <= s.size()) {
+        size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        if (j > i) out.push_back(s.substr(i, j - i));
+        i = j + 1;
+    }
+    return out;
+}
+
+/* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown
+ * flag is an error naming it, not a warning: a typo in a budget flag is the difference between
+ * the plan you asked for and one the planner invented. */
+int config_parse(int argc, char** argv, Config* c) {
+    auto need = [&](int& i) -> const char* {
+        if (i + 1 >= argc) { RAD_ERR("%s needs an argument", argv[i]); return nullptr; }
+        return argv[++i];
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        const char* v = nullptr;
+        auto S = [&](const char* n) { return a == n; };
+
+        if (S("--help") || S("-h"))            return 1;
+        else if (S("-v"))                      log_set_level(Log::Debug);
+        else if (S("-vv"))                     log_set_level(Log::Trace);
+        else if (S("--model"))                 { if (!(v = need(i))) return RAD_E_INVAL; c->model = v; }
+        else if (S("--radiance-home"))         { if (!(v = need(i))) return RAD_E_INVAL; c->radiance_home = v; }
+        else if (S("--kernels"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kernel_hierarchy = split_commas(v); }
+        else if (S("--tp"))                    { if (!(v = need(i))) return RAD_E_INVAL; c->tp = atoi(v); }
+        else if (S("--tp-wire")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "exact")) c->tp_wire_exact = 1;
+            else if (!std::strcmp(v, "wht6"))  c->tp_wire_exact = 0;
+            else { RAD_ERR("--tp-wire takes exact or wht6, not '%s'", v); return RAD_E_INVAL; }
+        }
+        else if (S("--tp-wire-min-kb"))        { if (!(v = need(i))) return RAD_E_INVAL; c->tp_wire_min_kb = atoll(v); }
+        else if (S("--max-num-batched-tokens")){ if (!(v = need(i))) return RAD_E_INVAL; c->max_tok = atoll(v); }
+        else if (S("--max-num-seqs"))          { if (!(v = need(i))) return RAD_E_INVAL; c->max_seqs = atoll(v); }
+        else if (S("--max-model-len"))         { if (!(v = need(i))) return RAD_E_INVAL; c->max_ctx = atoll(v); }
+        else if (S("--vram-weights-mib"))      { if (!(v = need(i))) return RAD_E_INVAL; c->vram_weights_mib = atoll(v); }
+        else if (S("--vram-kv-mib"))           { if (!(v = need(i))) return RAD_E_INVAL; c->vram_kv_mib = atoll(v); }
+        /* --gpu-headroom takes the short name too: it is the flag an operator reaches for and
+         * "-mib" is the unit, which every other size flag in this list also spells out. Both
+         * parse to the same field. */
+        else if (S("--gpu-headroom-mib") || S("--gpu-headroom"))
+                                               { if (!(v = need(i))) return RAD_E_INVAL; c->gpu_headroom_mib = atoll(v); }
+        else if (S("--kv-cache-dtype")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (std::strcmp(v, "bf16") && std::strcmp(v, "fp8")) {
+                RAD_ERR("--kv-cache-dtype takes bf16 or fp8, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->kv_cache_dtype = v;
+        }
+        else if (S("--expert-vs-cache-ratio")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            c->expert_cache_ratio = atof(v);
+            if (!(c->expert_cache_ratio > 0.0 && c->expert_cache_ratio < 1.0)) {
+                RAD_ERR("--expert-vs-cache-ratio is the WEIGHTS share of what is claimed and must "
+                        "be strictly between 0 and 1, not '%s'. 0.75 gives three quarters to "
+                        "weights and a quarter to the KV cache.", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--host-pool-mib"))         { if (!(v = need(i))) return RAD_E_INVAL; c->host_pool_mib = atoll(v); }
+        else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
+        else if (S("--prefix-cache-host-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_host_mib = atoll(v); }
+        else if (S("--prefix-cache-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }
+        else if (S("--prefix-cache-disk-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_disk_mib = atoll(v); }
+        else if (S("--placement"))             { if (!(v = need(i))) return RAD_E_INVAL; c->placement = v; }
+        else if (S("--deterministic"))         c->deterministic = true;
+        else if (S("--checkpoint-interval"))   { if (!(v = need(i))) return RAD_E_INVAL; c->checkpoint_interval = atoll(v); }
+        else if (S("--checkpoint-slots"))      { if (!(v = need(i))) return RAD_E_INVAL; c->checkpoint_slots = atoll(v); }
+        else if (S("--no-prefix-cache"))       c->prefix_cache = false;
+        else if (S("--checkpoint-policy")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* Named here rather than accepted blind: a policy name this build does not know would
+             * otherwise fall through to the default and the measurement would compare the default
+             * against itself. */
+            if (std::strcmp(v, "geometric-backoff") && std::strcmp(v, "tip-only") &&
+                std::strcmp(v, "keep-all")) {
+                RAD_ERR("--checkpoint-policy '%s' is not one of geometric-backoff, tip-only, "
+                        "keep-all", v);
+                return RAD_E_INVAL;
+            }
+            c->checkpoint_policy = v;
+        }
+        else if (S("--num-speculative-tokens")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            /* "auto" is -1 and the engine resolves it once the container is open: the depth is a
+             * property of the DRAFTER and the ARCHITECTURE PLUGIN is the one that knows it
+             * (rad_arch_probe): a serial head names a measured throughput trade-off, a block
+             * drafter names the block length its checkpoint was trained at. */
+            if (!std::strcmp(v, "auto")) c->n_spec = -1;
+            else c->n_spec = atoi(v);
+            /* Every negative depth reads as auto downstream, so only the word may say it. */
+            if (std::strcmp(v, "auto") && c->n_spec < 0) {
+                RAD_ERR("--num-speculative-tokens takes auto or a depth >= 0 (0 turns speculation "
+                        "off), not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--draft-model")) {
+            /* REFUSED, NOT QUIETLY IGNORED. Accepting this flag and then serving the container's
+             * own drafter -- or none -- would hand the caller a server that is not the one they
+             * asked for, with nothing in the output to say so.
+             *
+             * It refuses rather than disappearing because a caller coming from vLLM will reach
+             * for it, and a message that says where the drafter actually comes from is the whole
+             * value the flag can still deliver. This engine loads its drafter from the model
+             * container: rad-convert's OWN --draft-model merges one in, and an MTP head
+             * that ships inside the target checkpoint needs no flag at all. spec.md §10's
+             * "separate draft models load as a second plugin" is a design, not a feature. */
+            if (!(v = need(i))) return RAD_E_INVAL;
+            RAD_ERR("--draft-model is not implemented. This engine loads its drafter from the "
+                    "model container, not from a second one: merge it at conversion time with "
+                    "`rad-convert --draft-model DIR` and pass the container to --model. "
+                    "An MTP head that ships inside the target checkpoint needs neither flag.");
+            return RAD_E_INVAL;
+        }
+        else if (S("--host"))                  { if (!(v = need(i))) return RAD_E_INVAL; c->host = v; }
+        else if (S("--port"))                  { if (!(v = need(i))) return RAD_E_INVAL; c->port = atoi(v); }
+        else if (S("--api-key"))               { if (!(v = need(i))) return RAD_E_INVAL; c->api_key = v; }
+        else if (S("--mm-max-patches")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->mm_max_patches = -1;
+            else {
+                char* end = nullptr;
+                const long long n = std::strtoll(v, &end, 10);
+                if (!end || *end || n < 0) {
+                    RAD_ERR("--mm-max-patches takes auto or a patch count >= 0, not '%s'", v);
+                    return RAD_E_INVAL;
+                }
+                c->mm_max_patches = n;
+            }
+        }
+        else if (S("--reasoning-effort"))      { if (!(v = need(i))) return RAD_E_INVAL;
+                                                 c->reasoning_effort = v; }
+        else if (S("--generation-config"))     { if (!(v = need(i))) return RAD_E_INVAL;
+                                                 c->generation_config = v; }
+        /* A NEGATIVE VALUE IS REFUSED HERE, not left to the range checks below: the fields use
+         * a negative number to mean "not set", so `--temp -0.5` would otherwise be read as no
+         * flag at all and the container's default served in its place. */
+        else if (S("--temp"))                  { if (!(v = need(i))) return RAD_E_INVAL;
+                                                 c->sample_temp = (float)atof(v);
+                                                 if (!(c->sample_temp >= 0.0f)) {
+                                                     RAD_ERR("--temp must be in [0, 2], not '%s'", v);
+                                                     return RAD_E_INVAL; } }
+        else if (S("--top-k"))                 { if (!(v = need(i))) return RAD_E_INVAL;
+                                                 c->sample_top_k = atoi(v);
+                                                 if (c->sample_top_k < 0) {
+                                                     RAD_ERR("--top-k must be >= 0 (0 disables "
+                                                             "it), not '%s'", v);
+                                                     return RAD_E_INVAL; } }
+        else if (S("--top-p"))                 { if (!(v = need(i))) return RAD_E_INVAL;
+                                                 c->sample_top_p = (float)atof(v);
+                                                 if (!(c->sample_top_p >= 0.0f)) {
+                                                     RAD_ERR("--top-p must be in (0, 1], not '%s'", v);
+                                                     return RAD_E_INVAL; } }
+        else if (S("--min-p"))                 { if (!(v = need(i))) return RAD_E_INVAL;
+                                                 c->sample_min_p = (float)atof(v);
+                                                 if (!(c->sample_min_p >= 0.0f)) {
+                                                     RAD_ERR("--min-p must be in [0, 1], not '%s'", v);
+                                                     return RAD_E_INVAL; } }
+        else if (S("--kld-record"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_record = v; }
+        else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
+        else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
+        else if (S("--kld-out"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_out = v; }
+        else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
+        else if (S("--debug-selection"))       c->debug_selection = true;
+        else if (S("--debug-placement"))       c->debug_placement = true;
+        else if (S("--debug-accept-reference-kernels")) c->accept_reference_kernels = true;
+        else if (S("--profile-ops"))           c->profile_ops = true;
+        else if (S("--live"))                  c->live_view = true;
+        else {
+            RAD_ERR("unknown option '%s'", a.c_str());
+            return RAD_E_INVAL;
+        }
+    }
+
+    if (c->radiance_home.empty()) {
+        const char* h = getenv("RADIANCE_HOME");
+        c->radiance_home = h ? h : RAD_DEFAULT_HOME;
+    }
+    if (c->kernel_hierarchy.empty()) {
+        /* RADIANCE_KERNELS, ahead of the built-in default.
+         *
+         * The tools read the same variable through rad_hierarchy_from_env() in tools/iface.cpp,
+         * and the engine has to honour it too: otherwise an operator who validated a third-party
+         * plugin with rad-kbench or rad-tune has no way to serve with it short of editing every
+         * launcher's command line. Same spelling, same separator. */
+        const char* e = getenv("RADIANCE_KERNELS");
+        if (e && *e) c->kernel_hierarchy = split_commas(e);
+    }
+    /* AND THERE IS NO BUILT-IN DEFAULT, deliberately. Naming a library here -- the RDNA4 one, say
+     * -- would make the core carry the name of one card's kernels, and on any other machine that
+     * name matches nothing: the engine would warn about a library that is not installed and then
+     * rank the one that IS installed behind the reference implementation, which matches every op
+     * and would answer for all of them.
+     *
+     * An empty hierarchy is not "no order". The loader orders what it finds: everything named by
+     * --kernels or RADIANCE_KERNELS first, then every other plugin, then the reference library
+     * last by construction because it matches anything (core/plugin/loader.cpp). So dropping a
+     * kernel library into $RADIANCE_HOME/kernels is enough to be used, on any card, with no
+     * configuration -- and naming one ahead of another is what settles a tie between two that
+     * both serve an op. */
+    if (c->model.empty()) {
+        RAD_ERR("--model is required");
+        return RAD_E_INVAL;
+    }
+    if (c->tp < 1) { RAD_ERR("--tp must be >= 1"); return RAD_E_INVAL; }
+
+    /* THE KL MODE: one direction, and each direction with what it reads. A run given both would
+     * have to pick which one the operator meant, and picking wrong records a quantised model as
+     * the yardstick. */
+    if (!c->kld_record.empty() && !c->kld_ref.empty()) {
+        RAD_ERR("--kld-record writes a reference and --kld-ref scores against one; give one");
+        return RAD_E_INVAL;
+    }
+    if (!c->kld_record.empty() && c->kld_corpus.empty()) {
+        RAD_ERR("--kld-record needs --kld-corpus: the reference is recorded over a corpus");
+        return RAD_E_INVAL;
+    }
+    if (!c->kld_ref.empty() && !c->kld_corpus.empty()) {
+        RAD_ERR("--kld-ref reads its tokens from the reference, which recorded them; drop "
+                "--kld-corpus");
+        return RAD_E_INVAL;
+    }
+    if (!c->kld_out.empty() && c->kld_ref.empty()) {
+        RAD_ERR("--kld-out is the --kld-ref report");
+        return RAD_E_INVAL;
+    }
+
+    /* THE SAME RANGES THE REQUEST PARSER ENFORCES, and refused here rather than at the first
+     * request. A default outside them would otherwise be a 400 on every request that omits the
+     * field -- a server that starts, reports healthy, and answers nothing. */
+    if (c->sample_temp >= 0.0f && c->sample_temp > 2.0f) {
+        RAD_ERR("--temp must be in [0, 2]"); return RAD_E_INVAL; }
+    if (c->sample_top_p >= 0.0f && !(c->sample_top_p > 0.0f && c->sample_top_p <= 1.0f)) {
+        RAD_ERR("--top-p must be in (0, 1]"); return RAD_E_INVAL; }
+    if (c->sample_min_p >= 0.0f && c->sample_min_p > 1.0f) {
+        RAD_ERR("--min-p must be in [0, 1]"); return RAD_E_INVAL; }
+
+    return RAD_OK;
+}
+
+}  /* namespace rad */

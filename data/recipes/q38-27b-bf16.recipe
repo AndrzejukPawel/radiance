@@ -1,0 +1,11 @@
+# q38-27b-bf16.recipe -- Qwen3.8-27B (the bf16 release), as the q38-27b-bf16.rad container serves
+# it.
+#
+#   rad-convert <Qwen3.8-27B checkpoint> --recipe data/recipes/q38-27b-bf16.recipe \
+#       -o q38-27b-bf16.rad
+#
+# Every weight is served at the checkpoint's own precision except the lm_head, which is block fp8:
+# the widest GEMM in the model at half the bytes, read through the fp8 logits kernel. Without this
+# rule the same checkpoint loads directly and the head is read as bf16.
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16

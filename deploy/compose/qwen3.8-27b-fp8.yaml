@@ -1,0 +1,11 @@
+# Qwen3.8-27B, FP8 as published, with its DFlash2 block-diffusion drafter merged into the
+# container; the speculation depth is the drafter's own operating point.
+name: radiance-qwen3.8-27b-fp8
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-qwen3.8-27b-fp8
+    command: >
+      --model /models/qwen3.8-27b-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8

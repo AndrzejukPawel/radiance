@@ -1,0 +1,62 @@
+diff --git a/common/jinja/value.cpp b/common/jinja/value.cpp
+index 0b79098..16b8bbf 100644
+--- a/common/jinja/value.cpp
++++ b/common/jinja/value.cpp
+@@ -261,6 +261,44 @@ static value tojson(const func_args & args) {
+     return mk_val<value_string>(json_str);
+ }
+ 
++/* jinja2's min()/max() over a sequence: the smallest (largest) ITEM, compared by `attribute`
++ * where one is given, and undefined for an empty sequence. `case_sensitive` is accepted and
++ * ignored, exactly as `sort` above it does. */
++template<value_compare_op op>
++static value minmax_fn(const func_args & args) {
++    args.ensure_count(1, 3);
++    if (!is_val<value_array>(args.get_pos(0))) {
++        throw raised_exception("min/max: first argument must be an array");
++    }
++    value val       = args.get_pos(0);
++    value attribute = args.get_kwarg_or_pos("attribute", 2);
++    const bool attr_is_int = is_val<value_int>(attribute);
++    const int64_t attr_int = attr_is_int ? attribute->as_int() : 0;
++    const std::vector<value> arr = val->as_array();   // copy, as sort does
++    if (arr.empty()) {
++        return mk_val<value_undefined>();
++    }
++    auto key = [&](const value & v) -> value {
++        if (attribute->is_undefined()) {
++            return v;
++        }
++        if (attr_is_int && is_val<value_array>(v)) {
++            return v->at(attr_int);
++        }
++        if (!attr_is_int && is_val<value_object>(v)) {
++            return v->at(attribute);
++        }
++        throw raised_exception("min/max: unsupported object attribute comparison on " + v->type());
++    };
++    value best = arr[0];
++    for (size_t i = 1; i < arr.size(); ++i) {
++        if (value_compare(key(arr[i]), key(best), op)) {
++            best = arr[i];
++        }
++    }
++    return best;
++}
++
+ template<bool is_reject>
+ static value selectattr(const func_args & args) {
+     args.ensure_count(2, 4);
+@@ -1082,6 +1120,12 @@ const func_builtins & value_array_t::get_builtins() const {
+             });
+             return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
+         }},
++        /* RADIANCE: upstream has sort but neither min nor max, and a template that uses one
++         * throws mid-render -- which the capability probe SWALLOWS, so the model is reported as
++         * having no tool support at all instead of the engine being reported as short a filter.
++         * MiniCPM5-2B's tool block is exactly that template. */
++        {"min", minmax_fn<value_compare_op::lt>},
++        {"max", minmax_fn<value_compare_op::gt>},
+         {"reverse", [](const func_args & args) -> value {
+             args.ensure_vals<value_array>();
+             value val = args.get_pos(0);

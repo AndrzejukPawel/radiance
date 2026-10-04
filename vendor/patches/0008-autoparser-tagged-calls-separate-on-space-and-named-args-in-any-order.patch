@@ -1,0 +1,174 @@
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index ed895b5..104fe47 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -412,7 +412,11 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
+ 
+     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
++    /* RADIANCE: and anything AFTER the last call is content too. p.end() immediately after the
++     * calls means a model that signs off -- "Created the file." -- fails the whole parse for it,
++     * which is the same trap as the one above with the ends swapped. */
++    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls +
++           p.optional(p.content(p.rest())) + p.end();
+ }
+ 
+ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
+@@ -443,15 +447,38 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+         for (const auto & [param_name, param_schema] : properties.items()) {
+             bool is_required = required.find(param_name) != required.end();
+ 
++            /* RADIANCE: A NON-STRING ARGUMENT THAT IS NOT VALID JSON IS STILL AN ARGUMENT.
++             *
++             * An array or object parameter is matched by a schema-constrained JSON parser, and
++             * models do not reliably write JSON inside an XML tag. MiniCPM5 writes Python:
++             * `<param name="edits">[{'oldText': 'a', 'newText': 'b'}]</param>`. The JSON parser
++             * cannot begin on a single quote, so the argument does not match, the call does not
++             * match, and p.end() makes that the whole reply -- which comes back as prose with
++             * the tags in it. The model reads that as the tool rejecting its call and tries
++             * again, differently and just as fruitlessly; in one session it went round four
++             * times, and once rewrote the call with the arguments reordered to appease it.
++             *
++             * Strict JSON is still tried FIRST, so nothing that parses today parses differently.
++             * The fallback takes the value the way a string argument takes it -- as the text up
++             * to `</param>`, which is what actually delimits it in this format -- and the mapper
++             * already normalises a Python-style container to JSON from there
++             * (normalize_container_value in chat-peg-parser.cpp). What is given up is schema
++             * VALIDATION of the argument, and a mistyped argument reaching the tool as a mistyped
++             * argument is strictly better than a correct call reaching the user as prose. */
++            common_peg_parser value_parser = p.choice();
++            if (schema_info.resolves_to_string(param_schema)) {
++                value_parser = p.tool_arg_string_value(until_suffix);
++            } else {
++                value_parser |= p.tool_arg_json_value(p.schema(
++                                    p.json(), "tool-" + name + "-arg-" + param_name + "-schema",
++                                    param_schema, false)) + p.space();
++                value_parser |= p.tool_arg_json_value(until_suffix);
++            }
++
+             auto arg =
+                 p.tool_arg(p.tool_arg_open(arguments.name_prefix + p.tool_arg_name(p.literal(param_name)) +
+                                            arguments.name_suffix) +
+-                           arguments.value_prefix +
+-                           (schema_info.resolves_to_string(param_schema) ?
+-                                p.tool_arg_string_value(until_suffix) :
+-                                p.tool_arg_json_value(p.schema(
+-                                    p.json(), "tool-" + name + "-arg-" + param_name + "-schema", param_schema, false)) +
+-                                    p.space()) +
++                           arguments.value_prefix + value_parser +
+                            p.tool_arg_close(p.literal(arguments.value_suffix)));
+ 
+             auto named_arg = p.rule("tool-" + name + "-arg-" + param_name, arg);
+@@ -462,22 +489,33 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+             }
+         }
+ 
+-        // Build required arg sequence in definition order
+-        common_peg_parser args_seq = p.eps();
+-        for (size_t i = 0; i < required_parsers.size(); i++) {
+-            if (i > 0) {
+-                args_seq = args_seq + p.space();
+-            }
+-            args_seq = args_seq + required_parsers[i];
++        /* RADIANCE: A NAMED ARGUMENT CARRIES ITS OWN NAME, SO ITS POSITION MEANS NOTHING.
++         *
++         * Required arguments were required IN SCHEMA ORDER. This format writes them as
++         * `<param name="path">..</param><param name="content">..</param>` -- the name is right
++         * there in the tag -- and a model emits them in whatever order it composed them, which
++         * for a write is very often the content first, because that is the part it was thinking
++         * about. The sequence then does not match, and since the rule ends in p.end() the failure
++         * is TOTAL: the call comes back to the client as prose with the tags still in it, which
++         * looks exactly like a model that cannot call tools.
++         *
++         * Every argument is accepted in any order here, required and optional alike. What the
++         * grammar gives up -- checking that each required argument appears exactly once -- was
++         * never its job: a call missing one is a bad call, and arriving at the tool AS a bad call
++         * says so, where arriving as prose says nothing at all. */
++        common_peg_parser any_arg = p.choice();
++        for (const auto & req : required_parsers) {
++            any_arg |= req;
++        }
++        for (const auto & opt : optional_parsers) {
++            any_arg |= opt;
+         }
+ 
+-        // Build optional args with flexible ordering
+-        if (!optional_parsers.empty()) {
+-            common_peg_parser any_opt = p.choice();
+-            for (const auto & opt : optional_parsers) {
+-                any_opt |= opt;
+-            }
+-            args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
++        common_peg_parser args_seq = p.eps();
++        if (!required_parsers.empty()) {
++            args_seq = any_arg + p.repeat(p.space() + any_arg, 0, -1);
++        } else if (!optional_parsers.empty()) {
++            args_seq = args_seq + p.repeat(p.space() + any_arg, 0, -1);
+         }
+ 
+         if (!arguments.start.empty()) {
+@@ -510,6 +548,12 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+ 
+     auto require_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+ 
++    /* RADIANCE: what opens a call, and therefore what content is read up to. See the return
++     * statement; computed here because the between-calls rule below needs it too. */
++    std::string trigger_marker = !format.section_start.empty()    ? format.section_start
++                                 : !format.per_call_start.empty() ? format.per_call_start
++                                                                  : function.name_prefix;
++
+     common_peg_parser tool_calls = p.eps();
+ 
+     if (!format.per_call_start.empty()) {
+@@ -525,11 +569,28 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+                                             (format.section_end.empty() ? p.end() : p.literal(format.section_end) + p.space()));
+         }
+     } else {
+-        std::string separator = ", ";  // Default
++        /* RADIANCE: A TAGGED CALL IS SELF-DELIMITING, SO THE SEPARATOR IS WHITESPACE.
++         *
++         * This used a literal ", " -- the separator of a JSON ARRAY of calls -- for a format
++         * whose calls are tags. MiniCPM5-2B writes
++         * `<function name="ls">..</function>\n<function name="bash">..</function>`, and the
++         * second call was required to begin with a comma and a space. It never does, so the
++         * rule failed -- and because the whole thing ends in p.end(), the failure is not "one
++         * call and some text", it is NO MATCH AT ALL: every reply with two calls in it came back
++         * as raw prose with the reasoning and the tags still in it. One call parsed, two never.
++         *
++         * A tagged call opens with its own name prefix and closes with its own close, so nothing
++         * between them is needed to tell one from the next. p.space() accepts the newline these
++         * models put there and the nothing that a template writing them adjacently produces. */
++        /* RADIANCE: and a model narrates BETWEEN calls too -- "Let me look at the tree." then a
++         * call, "Now the tests." then another. Only whitespace was allowed between them. */
++        common_peg_parser next_call =
++            p.space() + (trigger_marker.empty() ? p.eps() : p.optional(p.content(p.until(trigger_marker)))) +
++            tool_choice;
+ 
+         if (inputs.parallel_tool_calls) {
+             tool_calls = p.trigger_rule("tool-call", format.section_start + p.space() + tool_choice +
+-                                                         p.zero_or_more(separator + tool_choice) + p.space() +
++                                                         p.zero_or_more(next_call) + p.space() +
+                                                          format.section_end);
+         } else {
+             tool_calls = p.trigger_rule(
+@@ -541,7 +602,18 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+         tool_calls = p.optional(tool_calls);
+     }
+ 
+-    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
++    /* RADIANCE: WITH NO SECTION OR PER-CALL MARKER, NOTHING WAS ALLOWED BEFORE THE CALL.
++     *
++     * `content_before_tools` is what lets a model say something and THEN call a tool. It is
++     * driven by the section or per-call opener, and a format with neither -- this one -- got
++     * p.eps(), which permits no content at all. So a reply that opens with a sentence ("The
++     * workspace is empty. I will create a Tic Tac Toe implementation.") and then makes a
++     * perfectly well-formed call does not match, and p.end() turns that into a whole-parse
++     * failure: the call comes back as prose.
++     *
++     * What opens a call in a tagged format is the function name prefix, `<function name="`, so
++     * that is the marker to read up to. It is only a fallback -- a format that really does have
++     * a section or per-call opener still uses it, because that one starts earlier in the text. */
+     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
+ }

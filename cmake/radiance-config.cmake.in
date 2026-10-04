@@ -1,0 +1,104 @@
+# radiance-config.cmake -- what `find_package(radiance)` gets.
+#
+# This file exists so that a plugin can be built from a repository that is not this one, against
+# the installed ABI headers rather than a copy of abi/ taken out of a checkout, and installed into
+# the $RADIANCE_HOME the engine's loader scans. A plugin boundary that can only be crossed from
+# inside the tree is not a plugin boundary; it is a build layout.
+#
+# What a consumer gets:
+#   radiance::abi              the header-only ABI target -- abi/ plus RAD_DEFAULT_HOME,
+#                              RAD_HAVE_HIP and the ROCm include path, exactly as the engine's own
+#                              plugins were compiled with them
+#   rad_add_plugin()           the same function radiance builds its own plugins with
+#   RADIANCE_ABI_VERSION       the number the loader compares against, so a consumer can refuse at
+#                              configure time rather than at dlopen
+#   RADIANCE_HOME              the installed $RADIANCE_HOME; `cmake --install` puts a plugin
+#                              built with rad_add_plugin under it (RAD_PLUGIN_INSTALL_HOME)
+#   RADIANCE_KERNELS_DIR       ${RADIANCE_HOME}/kernels
+#   RADIANCE_ARCHITECTURES_DIR ${RADIANCE_HOME}/architectures
+#   RADIANCE_QUANTIZERS_DIR    ${RADIANCE_HOME}/quantizers
+#   RADIANCE_INCLUDE_DIR       the include root, for a consumer that wants the path rather than the
+#                              target (arch/common/ is installed under ${RADIANCE_INCLUDE_DIR}/arch)
+#   RAD_GPU_TARGETS            the offload architectures a device plugin is compiled for: the
+#                              consumer's -DRAD_GPU_TARGETS when given, else the ones radiance was
+#                              built for. The engine itself runs on every AMD GPU family, so a
+#                              plugin for a card the engine's build machine does not have is
+#                              ordinary.
+
+@PACKAGE_INIT@
+
+# The ABI version is not written here; it is read out of abi/rad_abi.h at radiance's
+# configure time and carried through. One number, in the header the loader compares against, so a
+# bump cannot be half-applied.
+set(RADIANCE_ABI_VERSION @RAD_ABI_VERSION@)
+
+set_and_check(RADIANCE_INCLUDE_DIR "@PACKAGE_RAD_INCLUDE_RELDIR@")
+
+# $RADIANCE_HOME, as a CACHE PATH so that a consumer building a plugin for an installed engine can
+# see and override where it is going in ccmake, and so that `cmake --install` on their project puts
+# the .so where this engine's loader will scan for it. Computed from PACKAGE_PREFIX_DIR rather than
+# baked absolute, so a relocated prefix still answers correctly.
+set(RADIANCE_HOME "@PACKAGE_RAD_HOME_RELDIR@" CACHE PATH
+    "\$RADIANCE_HOME of the radiance installation found by find_package(radiance)")
+set(RADIANCE_KERNELS_DIR       "${RADIANCE_HOME}/kernels")
+set(RADIANCE_ARCHITECTURES_DIR "${RADIANCE_HOME}/architectures")
+set(RADIANCE_QUANTIZERS_DIR    "${RADIANCE_HOME}/quantizers")
+# Where rad_add_plugin installs: under the home of the engine this consumer built against, which is
+# the one whose loader will scan it. A consumer installing somewhere else -- a home of its own on
+# $RADIANCE_HOME's search path, say -- sets this.
+set(RAD_PLUGIN_INSTALL_HOME "${RADIANCE_HOME}" CACHE PATH
+    "the \$RADIANCE_HOME rad_add_plugin installs plugins under")
+
+# The imported targets: radiance::abi, and whatever else the export set carries.
+include("${CMAKE_CURRENT_LIST_DIR}/radianceTargets.cmake")
+
+# The device-build facts rad_add_plugin needs, recorded at radiance's configure time and replayed
+# here under the same names the in-tree build uses -- one function body, one set of variable names.
+# A plugin compiled for a different gfx target than the engine that dlopens it is not a link error
+# and not a load error: it is a kernel that launches and computes garbage, so the target list is
+# carried across rather than re-detected.
+set(RAD_HIP_FOUND    @RAD_HIP_FOUND@)
+if(NOT DEFINED RAD_GPU_TARGETS)
+  set(RAD_GPU_TARGETS "@RAD_GPU_TARGETS@")
+endif()
+# The HIP runtime and headers as radiance found them, and where this machine has them when the
+# recorded path is not here -- a consumer building against an installed radiance on another
+# machine, or inside a container whose ROCm sits elsewhere.
+set(RAD_HIP_RUNTIME  "@RAD_HIP_RUNTIME@")
+if(RAD_HIP_FOUND)
+  if(NOT EXISTS "${RAD_HIP_RUNTIME}")
+    find_library(RAD_HIP_RUNTIME_HERE amdhip64 HINTS ENV ROCM_PATH ENV HIP_PATH /opt/rocm
+                 PATH_SUFFIXES lib lib64)
+    set(RAD_HIP_RUNTIME "${RAD_HIP_RUNTIME_HERE}")
+  endif()
+  set(_rad_rocm_inc "@RAD_ROCM_INCLUDE@")
+  if(NOT EXISTS "${_rad_rocm_inc}/hip/hip_runtime.h")
+    find_path(_rad_rocm_inc_here hip/hip_runtime.h HINTS ENV ROCM_PATH ENV HIP_PATH /opt/rocm
+              PATH_SUFFIXES include)
+    set(_rad_rocm_inc "${_rad_rocm_inc_here}")
+  endif()
+  if(_rad_rocm_inc)
+    set_property(TARGET radiance::abi APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${_rad_rocm_inc}")
+    set_property(TARGET radiance::abi APPEND PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_rad_rocm_inc}")
+  endif()
+  # The HIP compiler's two omissions the tree fixes for itself (CMakeLists.txt): no depfile, so no
+  # header is a dependency of a .hip object, and no system-include flag. Only where unset.
+  if(NOT CMAKE_DEPFILE_FLAGS_HIP)
+    set(CMAKE_DEPFILE_FLAGS_HIP "-MD -MT <DEP_TARGET> -MF <DEP_FILE>")
+  endif()
+  if(NOT CMAKE_INCLUDE_SYSTEM_FLAG_HIP)
+    set(CMAKE_INCLUDE_SYSTEM_FLAG_HIP "-isystem ")
+  endif()
+endif()
+
+# The build-tree $RADIANCE_HOME for the CONSUMER's build, so that a freshly built out-of-tree plugin
+# can be exercised with RADIANCE_HOME=<their build dir>/radiance_home before it is installed --
+# which is how an in-tree plugin is tested, and there is no reason the boundary should make that
+# harder. Not forced: a consumer who has already set it keeps their own.
+if(NOT DEFINED RAD_PLUGIN_OUT)
+  set(RAD_PLUGIN_OUT ${CMAKE_BINARY_DIR}/radiance_home)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/RadAddPlugin.cmake")
+
+check_required_components(radiance)

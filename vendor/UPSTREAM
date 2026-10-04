@@ -1,0 +1,416 @@
+vendor/ -- what is lifted, from where, and what we changed
+==========================================================
+
+The rule (spec.md §12): lifts live here, tracked to a named upstream commit, with local changes
+kept as a patch series rather than edited in place. Anything that could not be expressed as a
+patch was REWRITTEN into core/ under our own name instead, so this directory stays updatable.
+The bottom half of this file is the list of things that went the other way, and why -- that list
+is as much a part of the record as the lifts are.
+
+UPSTREAM
+--------
+
+  llama.cpp   https://github.com/ggml-org/llama.cpp
+              commit 06938ac129e5feee1e731323e5c37dc973de5573
+              ("tests : add support for qwen3 SSM archs (#24031)")
+              MIT.
+
+To refresh: check out the new upstream commit, re-copy the files listed below to the same paths,
+re-apply patches/*.patch with `patch -p1` from vendor/llama/, and update the commit above. Paths
+under vendor/llama/ mirror the upstream tree exactly so a patch generated with `git diff` in
+llama.cpp applies here unchanged.
+
+
+LIFTED FILES
+------------
+
+vendor/llama/LICENSE                         <- llama.cpp LICENSE
+
+    The MIT License every file lifted from llama.cpp is under, including those under core/ and
+    libquant/ that NOTICE names.
+
+vendor/llama/src/unicode.h
+vendor/llama/src/unicode.cpp                 <- llama.cpp src/unicode.{h,cpp}
+vendor/llama/src/unicode-data.h
+vendor/llama/src/unicode-data.cpp            <- llama.cpp src/unicode-data.{h,cpp}
+
+    The unicode category tables and the pre-tokeniser splitters. core/text reads the category
+    tables for the pre-tokeniser steps that are not regexes (Whitespace, Punctuation, Digits) and
+    for its UTF-8 helpers; it does not split with unicode_regex_split(), which dispatches a
+    pattern to a hand-written codepoint state machine where one exists (GPT-2, Llama-3, Qwen2,
+    Qwen3.5, Kimi-K2, the AFMoE digit rule, "[^\n]+|[\n]+") and to std::regex over a
+    category-collapsed copy of the text otherwise. Split patterns are compiled by
+    core/text/tokenizer_regex.cpp instead. The splitters remain as the reference encoder
+    tools/tokref runs, which tests/tokenizer_test and rad-tokcheck compare the tokeniser against.
+
+    LOCAL CHANGES: patches/0001-unicode-reject-codepoints-above-U-10FFFF.patch
+
+vendor/llama/common/unicode.h
+vendor/llama/common/unicode.cpp              <- llama.cpp common/unicode.{h,cpp}
+
+    A different file with the same basename: streaming UTF-8 parsing helpers, used only by the
+    jinja engine. Both are carried at their upstream paths, and vendor/CMakeLists.txt keeps
+    llama/common off the public include path so `#include "unicode.h"` can only ever mean one
+    of them.
+
+    LOCAL CHANGES: none.
+
+vendor/llama/common/jinja/                   <- llama.cpp common/jinja/
+    caps.{h,cpp} lexer.{h,cpp} parser.{h,cpp} runtime.{h,cpp} string.{h,cpp} value.{h,cpp}
+    utils.h README.md
+
+    The Jinja engine and the template capability probe (spec §12: 5.0k + 0.5k lines). It depends
+    on nlohmann/json and common/unicode.h and on nothing else in llama.cpp -- no ggml, no
+    llama.h, no common.h -- which is why it lifts cleanly and chat.cpp did not.
+
+    LOCAL CHANGES: none.
+
+vendor/llama/common/chat.{h,cpp}
+vendor/llama/common/chat-auto-parser.h
+vendor/llama/common/chat-auto-parser-generator.cpp
+vendor/llama/common/chat-auto-parser-helpers.{h,cpp}
+vendor/llama/common/chat-diff-analyzer.cpp
+vendor/llama/common/chat-peg-parser.{h,cpp}
+vendor/llama/common/peg-parser.{h,cpp}
+vendor/llama/common/json-partial.{h,cpp}
+vendor/llama/common/json-schema-to-grammar.{h,cpp}
+vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
+
+    Rendering a message list through a chat template, the differential analysis that finds a
+    template's reply delimiters, and the JSON-schema-to-GBNF converter the grammar path needs.
+    The note above says chat.cpp "does not" lift cleanly and that was true of the old chat.cpp,
+    which reached for llama.h and common.h; the auto-parser generation that replaced it does not,
+    so it is carried here rather than rewritten. The engine does NOT read replies with the PEG
+    parser the auto-parser generates: core/text/chatparse.cpp reads them in one streaming pass
+    from a format description, and core/text/chatfmt.cpp takes that description from the
+    analyser's derived markers (or from the architecture plugin). The PEG path survives only as
+    the oracle in tests/legacy/. core/text/chat.cpp, chatfmt.cpp and chatparse.cpp are the only
+    files in core/ that include any of these, which keeps a vendor refresh from rippling into the
+    server.
+
+    LOCAL CHANGES: patches/0002-chat-unclosed-reasoning-must-not-swallow-a-tool-call.patch
+                   patches/0003-json-schema-pattern-must-not-hang-or-index-empty.patch
+                   patches/0004-json-schema-refuse-what-it-cannot-enforce.patch
+                   patches/0005-chat-an-xml-argument-value-owns-its-indentation.patch
+                   patches/0006-jinja-min-and-max-over-a-sequence.patch
+                   patches/0007-autoparser-split-the-per-argument-suffix-from-the-call-close.patch
+                   patches/0008-autoparser-tagged-calls-separate-on-space-and-named-args-in-any-order.patch
+                   patches/0009-chat-a-cdata-section-is-punctuation-not-content.patch
+                   patches/0011-chat-add_bos-must-come-from-the-inputs.patch
+
+    On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
+    of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
+    on an empty vector for a leading quantifier; and a stray ']' or '}' -- in NON_LITERAL_SET, but
+    claimed by no arm of the scanner -- makes the literal arm break without consuming it, so the
+    loop reconsiders the same byte forever. core/text/chat.cpp:148 catches what the converter
+    throws, so its std::stoi range errors already come back as a clean refusal; a hang and a
+    read off the end of a container are the two things a catch cannot turn into a 400. The patch
+    adds a size test, two empty-container guards, and a did-we-consume-a-byte test at the bottom
+    of the loop, each recording an error the existing check_errors() already turns into a throw.
+
+    On 0004: three things upstream ACCEPTS and then gets wrong, each now refused by name.
+    A remote $ref is fetched through a callback the public entry point stubs out, so it silently
+    degrades into "accepts any object" -- we refuse and fetch nothing, because a sampler that
+    reaches the network to decide what tokens are legal is not one we ship. `"not"` has no case in
+    visit(), so it falls through to a rule accepting any value -- a constraint the caller asked
+    for, did not get, and is not told about. And a regex escape GBNF cannot spell (\d \w \s \b
+    \/ \-, a backreference) is copied into the output verbatim, so the converter returns success
+    and the grammar then fails to LOAD.
+
+    0003 and 0004 together are what core/sample/json_schema.cpp used to carry on its own. That was
+    a SECOND, independently hardened lift of this same file -- and, checked against a running
+    server, one that NO REQUEST COULD REACH: response_format on /v1/chat/completions is compiled
+    by THIS copy through the chat template, and on /v1/completions it is refused by the endpoint
+    accept-list before the fork's seam is called. So the hardened copy never ran and the copy that
+    serves every structured-output request was the unhardened one. The fork is deleted and its
+    refusals are here, which is where they were needed all along.
+
+vendor/nlohmann/json.hpp
+vendor/nlohmann/json_fwd.hpp                 <- llama.cpp vendor/nlohmann/nlohmann/*
+vendor/nlohmann/LICENSE.MIT                  <- nlohmann/json LICENSE.MIT at v3.12.0, the release
+                                                json.hpp names; llama.cpp does not carry it
+
+vendor/cpp-httplib/httplib.h
+vendor/cpp-httplib/httplib.cpp
+vendor/cpp-httplib/LICENSE                   <- llama.cpp vendor/cpp-httplib/cpp-httplib/*
+
+    Header-only JSON and a split-source HTTP library, both unmodified. The only difference from
+    upstream is the PATH: llama.cpp nests them one directory deeper (vendor/nlohmann/nlohmann/)
+    and puts the outer directory on the include path. Flattening lets `<nlohmann/json.hpp>` and
+    `<cpp-httplib/httplib.h>` resolve with vendor/ alone on the path, which is the one include
+    directory core/CMakeLists.txt already adds. No file content differs.
+
+    cpp-httplib's own CMakeLists.txt is NOT carried. vendor/CMakeLists.txt builds httplib.cpp
+    itself, because upstream's version reaches for llama.cpp's license and compile-flag helpers
+    and pulls in an SSL provider fetch we do not want. It was kept "for reference" for a while and
+    that was the wrong call: it set four CPPHTTPLIB_* definitions of its own beside the four
+    vendor/CMakeLists.txt sets, so a future disagreement between them would have been invisible --
+    the copy nobody builds is the copy nobody checks.
+
+    LOCAL CHANGES: none.
+
+
+REWRITTEN INTO core/ INSTEAD
+----------------------------
+
+spec §12 lists these as lifts. Each one turned out to be a file we would have had to modify
+heavily, and a file you modify heavily is a file that belongs in core/ under our own name -- so
+it is there, with a comment at the top naming what it was read from.
+
+  src/llama-grammar.{h,cpp} -> core/sample/gbnf.{h,cpp}
+      MIT, same upstream commit. The GBNF parser and the stack machine, element for element; it
+      is under core/sample/ rather than here because it is on the SAMPLING path and the sampler
+      owns it, where vendor/ belongs to the text frontend. gbnf.h's own header lists what changed
+      (llama_vocab became VocabView, GGML_ASSERT became status returns, and the parser gained the
+      partial-UTF-8 and lazy-trigger handling the server needs) so a re-lift knows what to
+      re-apply. Recorded here because it was not, and an MIT lift belongs in this list whichever
+      directory it sits in.
+
+  ggml/src/gguf.cpp        -> core/text/gguf.{h,cpp}
+      Upstream is a reader, a writer and a ggml_context builder welded together: it fills
+      `struct ggml_tensor`, calls ggml_blck_size(), and includes ggml.h for both. Taking it whole
+      means taking ggml, which §12 says we do not. The wire format is a header, a KV table, a
+      tensor directory and a padded blob, so the reader is a page of code. The one thing kept
+      verbatim is the block geometry of every ggml dtype, which is data rather than code and is
+      marked as such at the table.
+
+  src/llama-vocab.cpp      -> core/text/tokenizer.{h,cpp}
+      Welded to llama_model_loader, GGML_ASSERT and the llama_vocab class, and organised around a
+      pre-tokeniser identified by HASHING tokenizer.json against a hardcoded enum -- which is the
+      behaviour spec §12 exists to replace. The BPE bigram queue and the UGM Viterbi are
+      re-expressed with attribution; the enum is gone, and a declared RadVocabStep chain drives
+      the tokeniser instead.
+
+  convert_hf_to_gguf.py    -> core/text/tokenizer_json.cpp
+      Python, so not liftable at all. parse_tokenizer_json() interprets the declared
+      normalizer / pre_tokenizer / decoder chain and refuses, by name, any component it cannot
+      express -- rather than approximating it.
+
+  (no upstream)            -> core/text/unicode_norm.{h,cpp}, unicode_norm_data.cpp
+      llama.cpp has no NFC/NFD/NFKC/NFKD. Its `unicode_ranges_nfd` is a strip-accents table for
+      the WordPiece path, not a canonical decomposition. The tables here were generated once from
+      a system ICU; unicode_norm_data.cpp documents the recipe. radiance links no ICU.
+
+
+PATCH SERIES
+------------
+
+  patches/0001-unicode-reject-codepoints-above-U-10FFFF.patch
+
+      unicode_cpt_from_utf8() accepts a 4-byte sequence with a 0xF5..0xF7 lead and returns a
+      codepoint above U+10FFFF. unicode_cpt_to_utf8() then throws std::invalid_argument, and
+      nothing on the tokenise path catches it -- so four arbitrary bytes in a prompt terminate
+      the process. Measured: 93 of 15,000 random byte strings do it.
+
+      The patch rejects the out-of-range result at the decode site, where the existing
+      unicode_cpts_from_utf8() handler already turns an invalid_argument into U+FFFD. Every
+      sequence upstream accepts still decodes to the same codepoint, so nothing that worked
+      changes; only the crash does. Verified by re-running the 15,000-string comparison against
+      llama.cpp: identical output on all 14,907 strings it survives.
+
+  patches/0002-chat-unclosed-reasoning-must-not-swallow-a-tool-call.patch
+
+      analyze_reasoning::build_parser() ends a reasoning block with `until(</think>)`, and
+      `until` returns the REST OF THE INPUT when its delimiter never arrives. So a reply whose
+      reasoning block the model never closed was captured whole as reasoning_content -- and when
+      that reply contained a <tool_call>, the call went with it: parsed as reasoning text, not as
+      a call. The turn then carried no tool call and no content, and an agent driving the server
+      stopped dead. Templates shipped for this model family carry explicit self-heals for the
+      same shape, which is how we know models emit it.
+
+      The patch adds an ordered choice whose first branch is guarded by a peek: reasoning may
+      also end at the tool-call opener, but only when the opener is what actually stopped it.
+      Every reply that closes its reasoning block takes the second branch, which is upstream's
+      rule unchanged -- including reasoning that merely MENTIONS an opener, since such a reply
+      still has its closing tag and the peek never fires. The marker is handed down from
+      autoparser::build_parser(), the one scope that can see both the reasoning and the tool
+      analyzers. tests/chat_test.cpp pins all three shapes against the real Qwen3.8 template.
+
+  patches/0005-chat-an-xml-argument-value-owns-its-indentation.patch
+
+      common_chat_peg_mapper::map() strips "one leading whitespace character" from every tool
+      argument value. For Qwen's XML the grammar has ALREADY consumed the newline after
+      <parameter=x> -- the differential analyzer derives it as the value prefix -- so the
+      character that gets stripped is the first SPACE of the value. An agent's edit tool matches
+      old_string against the file byte for byte, so `    return a + b` arrives as
+      `   return a + b` and the edit never applies, on a model that wrote a perfectly good call.
+      Every indented hunk, every call, silently.
+
+      The patch strips the DELIMITER instead: one leading newline (\n or \r\n) and one trailing
+      one, and nothing else. Values with no surrounding newlines are unchanged, which is every
+      JSON-format call and every python-style one; only the tagged XML path can differ, and there
+      the delimiter is exactly what upstream meant to remove. tests/chat_test.cpp pins an indented
+      value and a multi-line one -- blank line, tab, trailing spaces -- against the real template.
+
+  patches/0006-jinja-min-and-max-over-a-sequence.patch
+
+      The engine has `sort` and `reverse` for an array but neither `min` nor `max`, and the
+      undefined-value table lists both -- so the omission is in the array table, not in the
+      design. A template that uses one throws mid-render, and the CAPABILITY PROBE SWALLOWS THE
+      EXCEPTION ("ignore exceptions during capability analysis"), so the template comes back
+      reporting tools=0 tool_calls=0: indistinguishable from a model that genuinely cannot call
+      tools. MiniCPM5-2B's tool block sets `[tool_calls_count, tool_sep_count]|min`, and the
+      symptom was /v1/chat/completions refusing `tools` with a 400 naming the MODEL.
+
+      jinja2 semantics: the smallest (largest) ITEM of the sequence, by `attribute` where one is
+      given, undefined for an empty sequence, `case_sensitive` accepted and ignored -- which is
+      what the `sort` beside it does with the same argument.
+
+  patches/0007-autoparser-split-the-per-argument-suffix-from-the-call-close.patch
+
+      analyze_arguments() takes everything after an argument's value as `value_suffix` and then
+      trims `function.close`, `per_call_end` or `section_end` off it. A template that declares
+      none of the three has nothing to cut against and keeps the lot. MiniCPM5-2B writes
+      `<function name="F"><param name="A">V</param></function>`, so the suffix came out
+      `</param></function><|im_end|>\n` with an EMPTY close, and no tool call could ever parse: a
+      second argument because the suffix closes the whole call, and even the FIRST because a
+      generated turn ends at `<|im_end|>` and never carries the newline the template writes
+      BETWEEN turns. Every call came back to the client as prose.
+
+      The boundary is already rendered, one phase later, by extract_argument_separator(): between
+      the first argument's value and the second argument's name marker is exactly the
+      per-argument suffix. The patch measures it there and splits the tail -- value_suffix
+      `</param>`, close `</function><|im_end|>` -- and declines, leaving upstream's result, if the
+      markers do not line up. Only reached when the derived close is empty, so every template
+      that already worked is untouched.
+
+      The close is measured off a TWO-CALL render, not off the tail of a one-call one: the tail is
+      what a template writes after the LAST call of a turn, so it carries the turn terminator, and
+      a close demanding `</function><|im_end|>` can only ever match a reply holding exactly one
+      call. Between the end of one call and the opener of the next there is no terminator.
+      core/server/adapters.h still strips a trailing terminator from content, for the paths where
+      the parser does not consume one.
+
+  patches/0008-autoparser-tagged-calls-separate-on-space-and-named-args-in-any-order.patch
+
+      TWO strictnesses in build_tool_parser_tag_tagged(), both of which turn a good call into
+      prose. The rule ends in p.end(), so neither failure is partial: an unmatched call fails the
+      whole parse and the optional `tool_calls` then matches NONE of them.
+
+      build_tool_parser_tag_tagged() separates parallel calls with a literal ", " -- the separator
+      of a JSON ARRAY of calls -- for a format whose calls are TAGS. MiniCPM5-2B writes
+      `<function name="ls">..</function>\n<function name="bash">..</function>`, so the second call
+      was required to begin with a comma and a space and never did.
+
+      The failure is not partial. The rule ends in p.end(), so a trailing unmatched call makes the
+      whole parse fail, and `tool_calls` being optional then matches ZERO of them: every reply
+      with two calls in it came back as raw prose with the reasoning and the tags still in it. One
+      call parsed, two never. Found by reading an agent transcript, where the client had parsed
+      the first call out of that prose itself and silently dropped the second.
+
+      A tagged call opens with its own name prefix and closes with its own close, so nothing
+      between them is needed to tell one from the next: the separator is p.space(), which accepts
+      the newline these models write and the nothing a template writing them adjacently produces.
+
+  patches/0009-chat-a-cdata-section-is-punctuation-not-content.patch
+
+      MiniCPM5's template instructs the model, verbatim: "If it contains <, & or newline
+      characters, wrap it in a CDATA block: <param name="p"><![CDATA[...]]></param>". The mapper
+      does not know that, so a `write` call arrived with `<![CDATA[` and `]]>` inside the argument
+      value and every source file an agent wrote would have carried them.
+
+      THE TWO ENDS ARE STRIPPED INDEPENDENTLY, and that is the whole of it. A streamed value is
+      re-parsed from the top on every chunk and the server sends only what is new, so a value
+      already emitted cannot be taken back. Requiring both delimiters before removing either let
+      the opener escape in the first chunk every time -- files came out beginning `<![CDATA[` and
+      ending `]]`, the model read back its own corrupted output, and it spent the rest of the
+      session trying to edit the markers out. Anything that could still BECOME the opener is held
+      back whole while the value is partial, as is a trailing `]` or `]]`, which is either the
+      start of the closer or the end of a JSON array; withholding keeps what is emitted a prefix
+      of the finished value, which is what the streaming diff requires.
+
+      Same family as 0005: the punctuation of an XML argument value is not part of it.
+
+  On 0008, the second half: REQUIRED ARGUMENTS WERE REQUIRED IN SCHEMA ORDER.
+
+      A tagged argument carries its own name -- `<param name="path">..</param>` -- so its
+      position means nothing, and a model emits them in whatever order it composed them. For a
+      write that is very often the content first, because that is the part it was thinking about.
+      Found in an agent transcript: the file was written, the model reviewed its own code, and
+      its follow-up `write` came back as prose ending
+      `]]></param><param name="path">/work/tic_tac_toe.py</param></function>`.
+
+      Every argument is accepted in any order now, required and optional alike. What the grammar
+      gives up -- checking that each required argument appears exactly once -- was never its job
+      here: a call missing one is a bad call, and arriving at the tool AS a bad call says so,
+      where arriving as prose says nothing at all. Scoped to the tagged builder; the JSON and
+      positional builders keep their ordering.
+
+  On 0008, the third: NOTHING WAS ALLOWED BEFORE THE CALL.
+
+      `content_before_tools` is what lets a model say a sentence and THEN call a tool, and it is
+      driven by the section or per-call opener. A format with neither -- this one -- got p.eps(),
+      which permits no content at all, so a reply opening "The workspace is empty. I need to
+      create a Tic Tac Toe implementation." and then making a well-formed call did not match, and
+      p.end() made that a whole-parse failure. What opens a call in a tagged format is the
+      function name prefix, so that is the marker to read up to; it is a fallback only, since a
+      format that really has a section or per-call opener starts earlier in the text than the
+      function name does.
+
+  On 0008, the fourth and fifth: CONTENT AFTER THE CALLS, AND BETWEEN THEM.
+
+      The same trap with the ends swapped. The rule was reasoning + optional(content) + calls +
+      p.end(), so a model that signs off after a call, or narrates between two of them ("Next, I
+      will check the current directory."), failed the whole parse. Content is now allowed after
+      the last call and before each subsequent one, read up to the same trigger marker.
+
+      All five of 0008's halves are one bug wearing different hats: the tool-call rule ends in
+      p.end(), so ANY mismatch anywhere fails everything and `tool_calls` being optional then
+      matches NONE. There is no partial credit, so every strictness in this grammar -- a comma, a
+      terminator, an argument order, a sentence -- presents identically, as a model that cannot
+      call tools.
+
+  On 0008, the sixth: A NON-STRING ARGUMENT THAT IS NOT VALID JSON.
+
+      An array or object parameter is matched by a schema-constrained JSON parser, and models do
+      not reliably write JSON inside an XML tag. MiniCPM5 writes Python:
+      `<param name="edits">[{'oldText': 'a', 'newText': 'b'}]</param>`. The JSON parser cannot
+      begin on a single quote, so the argument did not match, so the call did not, so the reply
+      came back as prose -- and the model, reading that as a rejection, rewrote the same call
+      four times, once reordering its arguments to appease it.
+
+      Strict JSON is still tried FIRST, so nothing that parses today parses differently. The
+      fallback takes the value the way a string argument takes it, as the text up to `</param>`,
+      which is what actually delimits it in this format -- and the mapper already normalises a
+      Python-style container to JSON from there (normalize_container_value, which upstream wrote
+      and the grammar never let it reach). What is given up is schema VALIDATION of the argument.
+      A mistyped argument reaching the tool as a mistyped argument is strictly better than a
+      correct call reaching the user as prose.
+
+0010-autoparser-an-undeclared-argument-must-not-lose-the-call.patch
+      chat-auto-parser-generator.cpp. Every argument arm matches its parameter name as a LITERAL,
+      so an argument the schema does not declare matches nothing, the call matches nothing, and
+      the tool rule's `p.end()` makes that THE WHOLE REPLY -- which reaches the caller as prose
+      with the XML in it. Observed on a live MiniCPM5-2B agent: a `read` tool whose only parameter
+      is `path`, called as `<param name="action">read</param>`, and the turn was lost. The cost is
+      not limited to the malformed argument: a call that is entirely valid is lost when one extra
+      argument sits beside it, which is the case the second test covers.
+
+      A generic arm is appended LAST to the ordered choice, matching any name up to the name's own
+      delimiter and taking the value the way a string argument takes it. Declared names still bind
+      to their own schema-checked arms first, so nothing that parsed before parses differently.
+      What is given up is knowing the argument was undeclared -- the TOOL gets to say so, properly,
+      and a reply that never arrives cannot.
+
+      THE DELIMITER AFTER THE NAME IS NOT ALWAYS `name_suffix`: this format decomposes
+      `<param name="path">v</param>` as prefix `<param name="`, name_suffix EMPTY and value_prefix
+      `">`. The first cut guarded on `!name_suffix.empty()` and so never built its own arm, built
+      clean and changed nothing. Read the analysis rather than assuming the decomposition.
+
+  patches/0011-chat-add_bos-must-come-from-the-inputs.patch
+
+      `common_chat_templates_inputs` carries add_bos and add_eos, and the jinja conversion
+      overwrote both from the TEMPLATES object -- which is only ever filled inside
+      common_chat_templates_init, off a llama_vocab. A host that passes `model = nullptr` and
+      supplies the vocabulary's facts as overrides had both flags stuck at false whatever it
+      asked for, and that is exactly the shape of this lift's use here: the .rad carries the
+      template, the BOS/EOS spellings and the add flags, so there is no llama_model to read.
+
+      The flag strips a BOS the TEMPLATE rendered, because the tokeniser is about to add one. Off,
+      a container whose tokeniser adds BOS and whose template also writes `bos_token` gets two.
+      The Llama-family templates write it and Qwen's do not, which is why nothing here saw it.
+
+      The two upstream callers that do set the field -- common_chat_format_single and
+      common_chat_format_example -- assign `inputs.add_bos = tmpls->add_bos` immediately before
+      calling apply, which is the redundancy you would expect if apply were meant to read the
+      inputs. The fix ORs the two, so those two callers behave exactly as before.

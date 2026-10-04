@@ -1,0 +1,104 @@
+diff --git a/common/chat-diff-analyzer.cpp b/common/chat-diff-analyzer.cpp
+index 0875c53..695765a 100644
+--- a/common/chat-diff-analyzer.cpp
++++ b/common/chat-diff-analyzer.cpp
+@@ -25,6 +25,10 @@ static const std::string FUN_FIRST = "FFF_FIRST_FUN_F";
+ static const std::string FUN_SECOND = "SSS_SECOND_FUN_S";
+ static const std::string ARG_FIRST = "AA_ARG_FST_AA";
+ static const std::string ARG_SECOND = "BB_ARG_SND_BB";
++/* RADIANCE: the value the one- and two-argument probes give ARG_FIRST. Named so the split in
++ * extract_argument_separator can find it rather than repeating the literal. */
++static const std::string ARG_FIRST_VALUE  = "XXXX";
++static const std::string ARG_SECOND_VALUE = "YYYY";
+ static const std::string USER_MSG = "U_USER_MSG Hello END_U";
+ static const std::string USER_MSG_TWO = "V_USER_MSG Hello END_V";
+ static const std::string ASSISTANT_MSG = "A_ASST_MSG I can help END_A";
+@@ -261,6 +265,7 @@ void autoparser::analyze_template(const common_chat_template & tmpl) {
+     LOG_DBG("arg_name_suffix: '%s'\n", tools.arguments.name_suffix.c_str());
+     LOG_DBG("arg_value_prefix: '%s'\n", tools.arguments.value_prefix.c_str());
+     LOG_DBG("arg_value_suffix: '%s'\n", tools.arguments.value_suffix.c_str());
++    LOG_DBG("arg_separator: '%s'\n", tools.arguments.separator.c_str());   /* RADIANCE */
+     LOG_DBG("name_field: '%s'\n", tools.format.name_field.c_str());
+     LOG_DBG("args_field: '%s'\n", tools.format.args_field.c_str());
+     LOG_DBG("id_field: '%s'\n", tools.format.id_field.c_str());
+@@ -1355,6 +1360,80 @@ void analyze_tools::extract_argument_separator() {
+         std::string separator        = until_common_prefix(diff.right, ARG_FIRST, ARG_SECOND);
+         arguments.separator = separator;
+     }
++
++    /* RADIANCE: THE PER-ARGUMENT SUFFIX AND THE CALL CLOSE CAME OUT AS ONE STRING.
++     *
++     * analyze_arguments() takes everything after the argument value as `value_suffix` and then
++     * trims `function.close`, `per_call_end` or `section_end` off it. A template that declares
++     * none of the three has nothing to cut against. MiniCPM5-2B is one: its calls are
++     * `<function name="F"><param name="A">V</param></function>`, so the suffix came out
++     * `</param></function><|im_end|>\n` with an EMPTY close, and two things then cannot parse --
++     * a call carrying a SECOND argument, because the suffix closes the whole call, and a call
++     * carrying one, because a generated turn ends at `<|im_end|>` and never carries the newline
++     * the template writes BETWEEN turns.
++     *
++     * The boundary is right here, in the render this function already has. Between the first
++     * argument's value and the second argument's name marker is exactly the per-argument suffix.
++     * Nothing is guessed: it is measured off a two-argument render, and every step declines
++     * rather than assuming if the markers do not line up. */
++    if (format.mode == tool_format::TAG_WITH_TAGGED && function.close.empty() &&
++        !arguments.name_prefix.empty() && !arguments.value_suffix.empty()) {
++        const std::string two = diff.prefix + diff.right + diff.suffix;
++        const size_t v1  = two.find(ARG_FIRST_VALUE);
++        const size_t a2  = v1 == std::string::npos ? std::string::npos : two.find(ARG_SECOND, v1);
++        const size_t npx = a2 == std::string::npos
++                               ? std::string::npos : two.rfind(arguments.name_prefix, a2);
++        if (npx != std::string::npos && npx >= v1 + ARG_FIRST_VALUE.size()) {
++            const std::string per_arg = two.substr(v1 + ARG_FIRST_VALUE.size(),
++                                                   npx - (v1 + ARG_FIRST_VALUE.size()));
++            const std::string tail    = arguments.value_suffix;
++            if (!per_arg.empty() && tail.size() > per_arg.size() &&
++                tail.compare(0, per_arg.size(), per_arg) == 0) {
++                arguments.value_suffix = per_arg;
++                function.close = trim_trailing_whitespace(tail.substr(per_arg.size()));
++
++                /* AND THE CLOSE FROM A TWO-CALL RENDER, for the same reason and by the same
++                 * method. The tail above is what a template writes after the LAST call of a
++                 * turn, so it carries the turn terminator -- `</function><|im_end|>` -- and a
++                 * close that demands the terminator can only ever match a reply with exactly ONE
++                 * call in it. Between the end of the first call and the opener of the second
++                 * there is no terminator, so that render measures the close alone.
++                 *
++                 * Anchored on the first call's second argument VALUE rather than on a count of
++                 * openers: `<function name="` also appears in this template's own instructions to
++                 * the model, in the system prompt, so counting occurrences finds the wrong one. */
++                json assistant_two_calls = json{
++                    { "role",       "assistant" },
++                    { "content",    ""          },
++                    { "tool_calls", json::array({ first_tool_call, second_tool_call }) }
++                };
++                auto calls = compare_variants(*tmpl, params, [&](template_params & p) {
++                    p.messages = json::array({ user_msg, assistant_two_calls }); });
++                if (calls) {
++                    const std::string c2 = calls->diff.prefix + calls->diff.right + calls->diff.suffix;
++                    const size_t lastv = c2.find(ARG_SECOND_VALUE);
++                    const size_t open2 = lastv == std::string::npos
++                                             ? std::string::npos
++                                             : c2.find(function.name_prefix,
++                                                       lastv + ARG_SECOND_VALUE.size());
++                    if (open2 != std::string::npos) {
++                        const std::string between =
++                            c2.substr(lastv + ARG_SECOND_VALUE.size(),
++                                      open2 - (lastv + ARG_SECOND_VALUE.size()));
++                        if (between.size() > per_arg.size() &&
++                            between.compare(0, per_arg.size(), per_arg) == 0) {
++                            /* Trailing whitespace is between-turn layout, never part of a
++                             * generated close; the parser skips space between calls itself. */
++                            function.close = trim_trailing_whitespace(between.substr(per_arg.size()));
++                        }
++                    }
++                }
++                LOG_DBG("RADIANCE split: value_suffix '%s', func_close '%s'\n",
++                        arguments.value_suffix.c_str(), function.close.c_str());
++
++            }
++        }
++    }
+ }
+ 
+ void analyze_tools::extract_args_markers() {

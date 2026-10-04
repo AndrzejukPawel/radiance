@@ -1,0 +1,16 @@
+# Qwen3.8-Flash-Next exactly as the checkpoint ships it, bf16 throughout (335 GiB). Larger than
+# both cards and the host pool together, so the routed experts that fit neither are read from the
+# container on every pass (--weights-disk-tier) and a step takes tens of seconds whatever its
+# size. A reference to calibrate and compare against, not a production server: 32K of context
+# keeps QSA's score plane for a 32K-token step at 1 GiB.
+name: radiance-flashnext-bf16
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-flashnext-bf16
+    command: >
+      --model /models/qwen3.8-flash-next-bf16.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --max-model-len 32768 --placement expert_tiered --weights-disk-tier --host-pool-mib 12288
+      --gpu-headroom-mib 768 --deterministic
+      --max-num-seqs 32 --max-num-batched-tokens 32768 --num-speculative-tokens 0

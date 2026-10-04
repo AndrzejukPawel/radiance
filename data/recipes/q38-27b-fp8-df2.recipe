@@ -1,0 +1,28 @@
+# q38-27b-fp8-df2.recipe -- Qwen3.8-27B-FP8 with the DFlash2 drafter, as the q38-27b-fp8-df2.rad
+# container serves it.
+#
+#   rad-convert <Qwen3.8-27B-FP8 checkpoint> --draft-model <DFlash2 checkpoint> \
+#       --recipe data/recipes/q38-27b-fp8-df2.recipe -o q38-27b-fp8-df2.rad
+#
+# The trunk's linears are block-scaled fp8 in the checkpoint and kept as they are; the norms, the
+# embedding, the delta net's a/b projection and the vision tower are bf16 and kept as they are.
+# What the recipe adds:
+#
+#   - the lm_head, block fp8: the widest GEMM in the model at half the bytes
+#   - the drafter's linears, block fp8 from its bf16 release: it is read whole on every decode
+#     step, and a draft is verified, so its precision can move acceptance and never an emitted token
+#   - the drafter's 2-bit copy of the target's head (u2 codes, an f16 scale and a u8 zero a group
+#     of 128), read by its draft rounds only
+#
+# The drafter's selector projection, codebooks and convolution weights stay bf16.
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16
+
+dflash.fc.weight                     rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16

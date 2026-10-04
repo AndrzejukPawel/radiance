@@ -1,0 +1,29 @@
+# minicpm5-2b-dspark.recipe -- MiniCPM5-2B with the DSpark drafter, as the minicpm5-2b-dspark.rad
+# container serves it (scripts/convdspark.sh).
+#
+# OpenBMB publishes MiniCPM5-2B in bf16 only, so every linear is made block fp8 here: one amax a
+# 128x128 block, scale = amax/448 rounded to bf16. The checkpoint then serves through llama_dense_fp8
+# with the graph llama_fp8 declares over an fp8 release. Also:
+#
+#   - the lm_head, block fp8: the widest GEMM in the model at half the bytes
+#   - the drafter's linears, block fp8 from its bf16 release
+#   - the drafter's 2-bit copy of the target's head (u2 codes, an f16 scale and a u8 zero a group
+#     of 128), read by its draft passes only
+#
+# Every norm, the embedding and the drafter's Markov codebooks stay bf16.
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16
+
+blk.*.attn_qkv.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_gate_up.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down.weight                rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+dspark.fc.weight                     rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.attn_q.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.attn_k.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.attn_v.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.attn_output.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.ffn_gate_up.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.ffn_down.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16

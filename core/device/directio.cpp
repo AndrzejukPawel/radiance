@@ -1,0 +1,228 @@
+/* directio.cpp -- see directio.h for why the page cache is not wanted here. */
+#include "directio.h"
+#include "../rad_internal.h"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+namespace rad {
+namespace {
+
+/* The bounce is one megabyte, allocated on first misaligned use and never on the aligned path.
+ * Big enough that a misaligned read of a whole weight is a handful of syscalls; small enough that
+ * a DirectFile nobody misuses costs nothing. */
+constexpr int64_t kBounceBytes = 1 << 20;
+
+int64_t align_down(int64_t v, int64_t a) { return v / a * a; }
+
+/* Fill `bytes` exactly. A short pread inside the file is a torn read, not a smaller one. */
+int pread_exact(int fd, void* dst, int64_t bytes, int64_t off) {
+    int64_t done = 0;
+    while (done < bytes) {
+        ssize_t r = ::pread(fd, (uint8_t*)dst + done, (size_t)(bytes - done), (off_t)(off + done));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return RAD_E_IO;
+        }
+        if (r == 0) return RAD_E_IO;   /* end of file inside a range the caller said was there */
+        done += r;
+    }
+    return RAD_OK;
+}
+
+/* As much as the file has, which is what the aligned superset of a misaligned tail asks for.
+ * Negative is an error; otherwise the byte count. */
+int64_t pread_some(int fd, void* dst, int64_t bytes, int64_t off) {
+    int64_t done = 0;
+    while (done < bytes) {
+        ssize_t r = ::pread(fd, (uint8_t*)dst + done, (size_t)(bytes - done), (off_t)(off + done));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return RAD_E_IO;
+        }
+        if (r == 0) break;
+        done += r;
+    }
+    return done;
+}
+
+int pwrite_exact(int fd, const void* src, int64_t bytes, int64_t off) {
+    int64_t done = 0;
+    while (done < bytes) {
+        ssize_t w = ::pwrite(fd, (const uint8_t*)src + done, (size_t)(bytes - done),
+                             (off_t)(off + done));
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            return RAD_E_IO;
+        }
+        done += w;
+    }
+    return RAD_OK;
+}
+
+}  /* namespace */
+
+DirectFile::~DirectFile() { close(); }
+
+int DirectFile::open(const char* path, int flags) {
+    if (!path || !*path) return RAD_E_INVAL;
+    close();
+
+    const bool want_write = (flags & RAD_DIO_WRITE) != 0;
+    /* O_RDWR whenever writing, even if the caller only said RAD_DIO_WRITE: a write that does not
+     * cover a whole block has to read the block first (see write_at), and O_WRONLY would turn that
+     * into an EBADF at the worst possible moment. */
+    int oflags = want_write ? O_RDWR : O_RDONLY;
+    if (flags & RAD_DIO_CREATE) oflags |= O_CREAT;
+    if (flags & RAD_DIO_TRUNC)  oflags |= O_TRUNC;
+
+    fd_ = ::open(path, oflags | O_DIRECT, 0600);
+    direct_ = fd_ >= 0;
+
+    if (fd_ < 0 && (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP)) {
+        /* The filesystem, not the file: tmpfs and some network mounts refuse O_DIRECT outright. */
+        if (flags & RAD_DIO_ALLOW_BUFFERED) {
+            fd_ = ::open(path, oflags, 0600);
+            direct_ = false;
+            if (fd_ >= 0)
+                RAD_WARN("directio: %s does not support O_DIRECT; opened buffered. Reads will go "
+                         "through the page cache, which is a second copy of every byte and evicts "
+                         "the weight pool's own pages.", path);
+        } else {
+            RAD_ERR("directio: cannot open %s with O_DIRECT: %s. The tier directory must be on a "
+                    "filesystem that supports it.", path, std::strerror(errno));
+            return RAD_E_IO;
+        }
+    }
+    if (fd_ < 0) {
+        RAD_ERR("directio: cannot open %s: %s", path, std::strerror(errno));
+        return RAD_E_IO;
+    }
+    return RAD_OK;
+}
+
+void DirectFile::close() {
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+    direct_ = false;
+    std::free(bounce_);
+    bounce_ = nullptr;
+    bounce_bytes_ = 0;
+}
+
+int64_t DirectFile::size() const {
+    if (fd_ < 0) return -1;
+    struct stat st{};
+    if (::fstat(fd_, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+}
+
+int DirectFile::bounce_ready() {
+    if (bounce_) return RAD_OK;
+    void* p = nullptr;
+    if (posix_memalign(&p, (size_t)alignment(), (size_t)kBounceBytes) != 0 || !p)
+        return RAD_E_NOMEM;
+    bounce_ = (uint8_t*)p;
+    bounce_bytes_ = kBounceBytes;
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ read */
+
+int DirectFile::read_at(void* dst, int64_t off, int64_t bytes) {
+    if (fd_ < 0) return RAD_E_STATE;
+    if (!dst || off < 0 || bytes < 0) return RAD_E_INVAL;
+    if (bytes == 0) return RAD_OK;
+
+    const int64_t A = alignment();
+    const bool aligned = (off % A) == 0 && (bytes % A) == 0 &&
+                         ((uintptr_t)dst % (uintptr_t)A) == 0;
+
+    /* THE PATH THAT MATTERS. One pread, straight into the caller's pinned buffer, no intermediate
+     * copy anywhere -- which is what makes the mover able to DMA from it (spec §5.4). Every extent
+     * the .rad container describes lands here, because the container aligns its movement units to
+     * RAD_ALIGN_UNIT and rad_dev_alloc aligns its pools to the same. */
+    if (aligned) return pread_exact(fd_, dst, bytes, off);
+
+    /* THE ONLY BOUNCE IN THE ENGINE'S READ PATH, and it is here because O_DIRECT gives no
+     * alternative: the kernel will EINVAL a transfer whose offset, length or buffer is not
+     * block-aligned, so an unaligned extent can either be read through an aligned superset and
+     * copied out, or not read at all. It is acceptable here and nowhere else for one reason --
+     * this path is not the mover's. It serves the tail of a file whose length is not a block
+     * multiple, and callers reading a header or a footer rather than a movement unit. Anything on
+     * the step path that finds itself here has a layout bug, not a performance problem. */
+    RAD_TRY(bounce_ready());
+
+    const int64_t lo = align_down(off, A);
+    const int64_t hi = align_up(off + bytes, A);
+    for (int64_t base = lo; base < hi; base += bounce_bytes_) {
+        const int64_t span = std::min(bounce_bytes_, hi - base);
+        const int64_t s = std::max(off, base);
+        const int64_t e = std::min(off + bytes, base + span);
+        if (e <= s) continue;
+
+        const int64_t got = pread_some(fd_, bounce_, span, base);
+        if (got < 0) return (int)got;
+        /* A short read is only survivable when the file ends past the slice the caller asked for.
+         * Otherwise the caller named bytes that are not in the file, which is RAD_E_IO and not a
+         * partial success (see read_at's contract in the header). */
+        if (got < e - base) return RAD_E_IO;
+        std::memcpy((uint8_t*)dst + (s - off), bounce_ + (s - base), (size_t)(e - s));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ write */
+
+/* The store is written to as well as read: the SSD prefix-cache tier (core/mem/sstier.cpp)
+ * publishes blocks, and the SSD weight tier is populated once at load. Both write whole aligned
+ * slots, so this has the same shape as read_at -- one fast path, and a read-modify-write for
+ * anything that does not cover a whole block. */
+int DirectFile::write_at(const void* src, int64_t off, int64_t bytes) {
+    if (fd_ < 0) return RAD_E_STATE;
+    if (!src || off < 0 || bytes < 0) return RAD_E_INVAL;
+    if (bytes == 0) return RAD_OK;
+
+    const int64_t A = alignment();
+    const bool aligned = (off % A) == 0 && (bytes % A) == 0 &&
+                         ((uintptr_t)src % (uintptr_t)A) == 0;
+    if (aligned) return pwrite_exact(fd_, src, bytes, off);
+
+    RAD_TRY(bounce_ready());
+    const int64_t old_size = size();
+    if (old_size < 0) return RAD_E_IO;
+
+    const int64_t lo = align_down(off, A);
+    const int64_t hi = align_up(off + bytes, A);
+    for (int64_t base = lo; base < hi; base += bounce_bytes_) {
+        const int64_t span = std::min(bounce_bytes_, hi - base);
+        /* Read-modify-write the whole chunk, including blocks the request covers completely. That
+         * is a wasted read per interior block and it is deliberate: the branchless version is
+         * short enough to be obviously correct, and this path exists for correctness at a boundary,
+         * not for throughput. The aligned path above is the one that has to be fast. */
+        const int64_t got = pread_some(fd_, bounce_, span, base);
+        if (got < 0) return (int)got;
+        if (got < span) std::memset(bounce_ + got, 0, (size_t)(span - got));
+
+        const int64_t s = std::max(off, base);
+        const int64_t e = std::min(off + bytes, base + span);
+        if (e > s)
+            std::memcpy(bounce_ + (s - base), (const uint8_t*)src + (s - off), (size_t)(e - s));
+        RAD_TRY(pwrite_exact(fd_, bounce_, span, base));
+    }
+
+    /* The last chunk padded the file out to a block boundary. Cut it back, so size() reports what
+     * was actually written and a later read_at of the tail sees the real end of file. */
+    const int64_t want = std::max(old_size, off + bytes);
+    if (size() > want && ::ftruncate(fd_, (off_t)want) != 0) return RAD_E_IO;
+    return RAD_OK;
+}
+
+}  /* namespace rad */

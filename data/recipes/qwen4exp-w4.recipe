@@ -1,0 +1,48 @@
+# qwen4exp-w4.recipe -- Qwen3.8-Flash-Next from its bf16 checkpoint, as the
+# q38-flashnext-w4-mtp.rad container serves it: fp8 linears, four-bit rotated experts, the n-gram
+# table at E4M3, the MTP head with its 2-bit draft head; the gated-residual mixing matrices and the
+# MTP head's fc matrices stay bf16 (qwen4exp-w4-hc8m.recipe makes those E4M3 too).
+#
+#   rad-convert <Qwen3.8-Flash-Next checkpoint> --recipe data/recipes/qwen4exp-w4.recipe \
+#       -o q38-flashnext-w4-mtp.rad
+#
+# The checkpoint carries no quantization_config, so everything not named here is served as the
+# checkpoint holds it: every norm gain, A_log, dt_bias, conv1d, the delta net's a/b projections
+# (48 rows, not a whole scale block), the router and shared-expert gate, the QSA indexer's
+# projection, the embedding, the PLE projections and the hyper-connection weights. Rank-1 weights a
+# pattern happens to match are declined by the quantiser and kept as they are. The first rule that
+# matches a weight decides it.
+
+# The routed experts, trunk and MTP layer alike: int4 codes, a bf16 scale a group of 128 along K,
+# each row rotated by the 128-wide Hadamard first. The experts are 112.8 GiB at E4M3 and do not fit
+# two cards; at four bits they do. Round-to-nearest with absmax scales; the calibrated GPTQ form of
+# the same encoding is one rule ahead of this file:
+#   --quant 'blk.*.ffn_*_exps.*.weight=gptq:codes=i4,group=128,scale=bf16,transform=fwht128,calib=$CALIB'
+blk.*.ffn_*_exps.*.weight            rtn  codes=i4 group=128 scale=bf16 transform=fwht128
+
+# The block-scaled fp8 linears: E4M3 codes, a bf16 scale a 128x128 block. The QSA indexer's
+# projection is not one of them: its top-k is a hard choice between blocks, and keeping it as the
+# checkpoint holds it costs 20 MB.
+blk.*.attn_qg.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_k.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_v.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_inz.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_out.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down_shexp.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The lm_head, block fp8: the widest GEMM in the model at half the bytes.
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The n-gram table, 51B parameters: E4M3 with ONE scale for all 320 million rows, fixed rather than
+# measured -- an absmax over the whole table cannot be taken a block of rows at a time, and the
+# table streams. 1.99317932128906e-4 is bf16 0x3951, the value Qwen3.8-Flash-Next-FP8 ships in its
+# own `ngram_embedding.weight_scale`; it sits on a three-octave plateau (2^-13..2^-10 give rel_l2
+# 0.02662 to five digits) with 1.7x headroom over the table's absmax.
+blk.*.ple_ngram.weight               rtn  codes=fp8_e4m3 block=*x* scale=bf16 rule=fixed scale_value=1.99317932128906e-4
+
+# The MTP head's 2-bit copy of the lm_head -- u2 codes, an f16 scale and a u8 zero a group of 128 --
+# which the draft rounds read in place of the full head. A draft is verified by the trunk, so this
+# moves acceptance and never an emitted token.
+mtp.draft_head.weight                rtn  codes=u2 zero=u8 group=128 scale=f16

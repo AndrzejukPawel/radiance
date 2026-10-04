@@ -1,0 +1,46 @@
+# qwen4exp-w4-hc8m.recipe -- Qwen3.8-Flash-Next from its bf16 checkpoint, as the
+# q38-flashnext-w4-mtp-hc8m.rad container serves it: qwen4exp-w4.recipe, plus the gated-residual
+# mixing matrices and the MTP head's two entry matrices as E4M3 rows.
+#
+#   rad-convert <Qwen3.8-Flash-Next checkpoint> --recipe data/recipes/qwen4exp-w4-hc8m.recipe \
+#       -o q38-flashnext-w4-mtp-hc8m.rad
+#
+# The uncensored release (orcarouter/Qwen3.8-Flash-Next-Uncensored) takes the same recipe.
+# Everything not named here is served as the checkpoint holds it; the first rule that matches a
+# weight decides it. The routed experts' GPTQ form is one rule ahead of this file:
+#   --quant 'blk.*.ffn_*_exps.*.weight=gptq:codes=i4,group=128,scale=bf16,transform=fwht128,calib=$CALIB'
+
+# The routed experts, trunk and MTP layer alike: int4, a bf16 scale a group of 128, rotated by the
+# 128-wide Hadamard. qwen4exp-w4.recipe says why.
+blk.*.ffn_*_exps.*.weight            rtn  codes=i4 group=128 scale=bf16 transform=fwht128
+
+# Every connection's two mixing matrices -- the 96 trunk connections, the final mixer and the MTP
+# head's three -- as E4M3 rows with an f32 scale a group of each row. A 128x128 block cannot cover
+# them: lowrank is 320, 2.5 blocks. Down is [320, 10240] and takes a scale every 128 columns; up is
+# [10240, 320] and takes four scales a row, 80 columns each.
+*_hc_down.weight                     rtn  codes=fp8_e4m3 group=128 scale=f32
+*_hc_up.weight                       rtn  codes=fp8_e4m3 group=80 scale=f32
+
+# The MTP head's fc_hidden and fc_embedding, the same rows. They only ever change the drafts.
+mtp.fc_hidden.weight                 rtn  codes=fp8_e4m3 group=128 scale=f32
+mtp.fc_embedding.weight              rtn  codes=fp8_e4m3 group=128 scale=f32
+
+# The block-scaled fp8 linears. The QSA indexer's projection is not one of them: its top-k is a
+# hard choice between blocks, and keeping it as the checkpoint holds it costs 20 MB.
+blk.*.attn_qg.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_k.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_v.weight                  rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_inz.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_out.weight                 rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down_shexp.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The lm_head, block fp8.
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The n-gram table at one fixed E4M3 scale; qwen4exp-w4.recipe says where the value comes from.
+blk.*.ple_ngram.weight               rtn  codes=fp8_e4m3 block=*x* scale=bf16 rule=fixed scale_value=1.99317932128906e-4
+
+# The MTP head's 2-bit draft head.
+mtp.draft_head.weight                rtn  codes=u2 zero=u8 group=128 scale=f16

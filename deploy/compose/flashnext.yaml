@@ -1,0 +1,18 @@
+# Qwen3.8-Flash-Next, the production container (data/recipes/qwen4exp-w4nl64-i8-hc8m.recipe):
+# int8 trunk and lm_head, routed experts as 4-bit codebook codes at E4M3 scales. The experts that
+# do not fit VRAM are streamed from a pinned host pool; idle sessions move to host memory and then
+# to disk under /data/kvcache/flashnext.
+name: radiance-flashnext
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-flashnext
+    command: >
+      --model /models/qwen3.8-next-flash-fp8-iq4r-moe.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000
+      --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96
+      --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8
+      --prefix-cache-host-mib 4096 --prefix-cache-dir /data/kvcache/flashnext
+      --prefix-cache-disk-mib 131072
+      --num-speculative-tokens 3 --max-num-batched-tokens 2048

@@ -1,0 +1,244 @@
+/* gen_tokenizer_ucd -- writes core/text/tokenizer_ucd.cpp, the Unicode tables the pre-tokeniser
+ * regex compiler reads.
+ *
+ * The tables are READ OUT OF ONIGURUMA rather than derived from the UCD text files, because the
+ * reference a tokenizer.json pattern is judged against is HuggingFace `tokenizers`, and that
+ * library runs every Split pattern through Oniguruma. Whatever Oniguruma answers for `\p{L}`,
+ * `\s`, `\w` or `(?i:s)` is by definition what the pattern means, including where its Unicode
+ * version or its definition of a property differs from another engine's. So each table is the
+ * literal answer of `onig_match` for that property, codepoint by codepoint, and the case-folding
+ * orbits are Oniguruma's own case-fold enumeration.
+ *
+ * Not built by CMake, because it links the system Oniguruma and nothing else in the tree does:
+ *
+ *   g++ -O2 -std=c++20 tools/gen_tokenizer_ucd.cpp -lonig -o gen_tokenizer_ucd
+ *   ./gen_tokenizer_ucd > core/text/tokenizer_ucd.cpp
+ *
+ * The Oniguruma it ran against is recorded in the output. Regenerate when the reference moves to a
+ * later Unicode version; tokenizer_regex_test's property and (?i) cases and tokenizer_test's
+ * Unicode-version case say what changed.
+ */
+#include <oniguruma.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <numeric>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr uint32_t kMax = 0x110000;
+
+bool is_surrogate(uint32_t c) { return c >= 0xD800 && c <= 0xDFFF; }
+
+std::string utf8(uint32_t c) {
+    std::string s;
+    if (c < 0x80) {
+        s += (char)c;
+    } else if (c < 0x800) {
+        s += (char)(0xC0 | (c >> 6));
+        s += (char)(0x80 | (c & 0x3F));
+    } else if (c < 0x10000) {
+        s += (char)(0xE0 | (c >> 12));
+        s += (char)(0x80 | ((c >> 6) & 0x3F));
+        s += (char)(0x80 | (c & 0x3F));
+    } else {
+        s += (char)(0xF0 | (c >> 18));
+        s += (char)(0x80 | ((c >> 12) & 0x3F));
+        s += (char)(0x80 | ((c >> 6) & 0x3F));
+        s += (char)(0x80 | (c & 0x3F));
+    }
+    return s;
+}
+
+struct Re {
+    regex_t* reg = nullptr;
+    OnigRegion* region = nullptr;
+    explicit Re(const std::string& pat) {
+        OnigErrorInfo einfo;
+        const OnigUChar* p = (const OnigUChar*)pat.data();
+        const int r = onig_new(&reg, p, p + pat.size(), ONIG_OPTION_NONE, ONIG_ENCODING_UTF8,
+                               ONIG_SYNTAX_RUBY, &einfo);
+        if (r != ONIG_NORMAL) {
+            std::fprintf(stderr, "onig_new(%s) failed: %d\n", pat.c_str(), r);
+            std::exit(1);
+        }
+        region = onig_region_new();
+    }
+    ~Re() { onig_region_free(region, 1); onig_free(reg); }
+    bool matches_whole(uint32_t c) const {
+        const std::string s = utf8(c);
+        const OnigUChar* b = (const OnigUChar*)s.data();
+        const OnigUChar* e = b + s.size();
+        return onig_match(reg, b, e, b, region, ONIG_OPTION_NONE) == (int)s.size();
+    }
+};
+
+using Ranges = std::vector<std::pair<uint32_t, uint32_t>>;
+
+Ranges ranges_of(const std::string& pat) {
+    Re re(pat);
+    Ranges out;
+    for (uint32_t c = 0; c < kMax; ++c) {
+        if (is_surrogate(c) || !re.matches_whole(c)) continue;
+        if (!out.empty() && out.back().second + 1 == c) out.back().second = c;
+        else out.push_back({ c, c });
+    }
+    return out;
+}
+
+void emit_ranges(const char* name, const Ranges& r) {
+    std::printf("const CpRange %s[] = {\n", name);
+    for (size_t i = 0; i < r.size(); ++i)
+        std::printf("%s{0x%X,0x%X},%s", i % 6 == 0 ? "    " : "", r[i].first, r[i].second,
+                    i % 6 == 5 || i + 1 == r.size() ? "\n" : " ");
+    std::printf("};\nconst size_t %s_n = sizeof(%s) / sizeof(%s[0]);\n\n", name, name, name);
+}
+
+}  /* namespace */
+
+int main() {
+    OnigEncoding encs[] = { ONIG_ENCODING_UTF8 };
+    onig_initialize(encs, 1);
+
+    /* The 29 general categories Oniguruma can name, in the order of rad::ucd::Gc. Cs has no
+     * member Oniguruma can be asked about (a surrogate is not UTF-8), so it is assigned below. */
+    static const char* kGc[] = {
+        "Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No",
+        "Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po", "Sm", "Sc", "Sk", "So",
+        "Zs", "Zl", "Zp", "Cc", "Cf", "Cs", "Co", "Cn",
+    };
+    const int kCs = 27;
+    std::vector<uint8_t> gc(kMax, 0xFF);
+    for (int g = 0; g < 30; ++g) {
+        if (g == kCs) continue;
+        Re re(std::string("\\p{") + kGc[g] + "}");
+        for (uint32_t c = 0; c < kMax; ++c) {
+            if (is_surrogate(c) || !re.matches_whole(c)) continue;
+            if (gc[c] != 0xFF) {
+                std::fprintf(stderr, "U+%04X is in two categories\n", c);
+                return 1;
+            }
+            gc[c] = (uint8_t)g;
+        }
+    }
+    for (uint32_t c = 0xD800; c <= 0xDFFF; ++c) gc[c] = kCs;
+    for (uint32_t c = 0; c < kMax; ++c) {
+        if (gc[c] == 0xFF) {
+            std::fprintf(stderr, "U+%04X is in no category\n", c);
+            return 1;
+        }
+    }
+
+    std::printf(
+        "/* tokenizer_ucd.cpp -- GENERATED by tools/gen_tokenizer_ucd.cpp; do not edit.\n"
+        " *\n"
+        " * Oniguruma %d.%d.%d, which is what HuggingFace tokenizers matches pre-tokeniser patterns\n"
+        " * with. See the generator for why the tables are read out of it. */\n"
+        "#include \"text/tokenizer_ucd.h\"\n\nnamespace rad {\nnamespace ucd {\n\n",
+        ONIGURUMA_VERSION_MAJOR, ONIGURUMA_VERSION_MINOR, ONIGURUMA_VERSION_TEENY);
+
+    /* General category as runs: each entry starts a run that lasts until the next one. */
+    std::printf("const GcRun k_gc_runs[] = {\n");
+    size_t n = 0;
+    for (uint32_t c = 0; c < kMax; ++c) {
+        if (c > 0 && gc[c] == gc[c - 1]) continue;
+        std::printf("%s{0x%X,%u},%s", n % 6 == 0 ? "    " : "", c, gc[c], n % 6 == 5 ? "\n" : " ");
+        ++n;
+    }
+    std::printf("\n};\nconst size_t k_gc_runs_n = sizeof(k_gc_runs) / sizeof(k_gc_runs[0]);\n\n");
+
+    /* `\w` has two definitions in Oniguruma. As an atom (and for `\b`) it asks the codepoint's
+     * ctype, which below U+0100 reads a Latin-1 table that counts the superscript digits and the
+     * vulgar fractions as word characters; inside a bracket class it adds the Unicode Word range
+     * table, which does not. Both are carried. The other shorthands agree in and out of a class,
+     * and the generator checks that rather than assuming it. */
+    for (const char* e : { "\\s", "\\d", "\\h" }) {
+        if (ranges_of(e) != ranges_of(std::string("[") + e + "]")) {
+            std::fprintf(stderr, "%s differs inside a class; the compiler assumes it does not\n", e);
+            return 1;
+        }
+    }
+    emit_ranges("k_white_space", ranges_of("\\s"));
+    emit_ranges("k_digit", ranges_of("\\d"));
+    emit_ranges("k_word", ranges_of("\\w"));
+    emit_ranges("k_word_class", ranges_of("[\\w]"));
+
+    /* Scripts a pre-tokeniser is known to name, plus the neighbours a model for the same
+     * languages would. Anything else is refused by name at load. */
+    static const char* kScripts[] = {
+        "Han", "Hiragana", "Katakana", "Hangul", "Bopomofo", "Latin", "Greek", "Cyrillic",
+        "Armenian", "Hebrew", "Arabic", "Thai", "Lao", "Khmer", "Myanmar", "Tibetan",
+        "Devanagari", "Bengali", "Gurmukhi", "Gujarati", "Oriya", "Tamil", "Telugu", "Kannada",
+        "Malayalam", "Sinhala", "Georgian", "Ethiopic", "Mongolian", "Common", "Inherited",
+    };
+    std::vector<std::string> script_tables;
+    for (const char* s : kScripts) {
+        std::string name = std::string("k_script_") + s;
+        emit_ranges(name.c_str(), ranges_of(std::string("\\p{") + s + "}"));
+        script_tables.push_back(name);
+    }
+    std::printf("const ScriptTable k_scripts[] = {\n");
+    for (size_t i = 0; i < script_tables.size(); ++i)
+        std::printf("    { \"%s\", %s, %s_n },\n", kScripts[i], script_tables[i].c_str(),
+                    script_tables[i].c_str());
+    std::printf("};\nconst size_t k_scripts_n = sizeof(k_scripts) / sizeof(k_scripts[0]);\n\n");
+
+    /* Case folding, as Oniguruma enumerates it for a single codepoint under the default fold
+     * flags: every other codepoint the pattern character matches under (?i), and whether it also
+     * matches a MULTI-codepoint sequence (U+00DF against "ss"). The single-codepoint relation is
+     * closed into orbits; the multi-codepoint ones are listed so the compiler can refuse them. */
+    std::vector<uint32_t> parent(kMax);
+    std::iota(parent.begin(), parent.end(), 0u);
+    auto find = [&](uint32_t x) {
+        while (parent[x] != x) x = parent[x] = parent[parent[x]];
+        return x;
+    };
+    std::set<uint32_t> multi;
+    for (uint32_t c = 0; c < kMax; ++c) {
+        if (is_surrogate(c)) continue;
+        const std::string s = utf8(c);
+        OnigCaseFoldCodeItem items[ONIGENC_GET_CASE_FOLD_CODES_MAX_NUM];
+        const OnigUChar* b = (const OnigUChar*)s.data();
+        const int k = ONIGENC_GET_CASE_FOLD_CODES_BY_STR(ONIG_ENCODING_UTF8, ONIGENC_CASE_FOLD_DEFAULT,
+                                                         b, b + s.size(), items);
+        for (int i = 0; i < k; ++i) {
+            if (items[i].byte_len != (int)s.size()) continue;
+            if (items[i].code_len != 1) { multi.insert(c); continue; }
+            const uint32_t a = find(c), d = find(items[i].code[0]);
+            if (a != d) parent[std::max(a, d)] = std::min(a, d);
+        }
+    }
+    std::map<uint32_t, std::vector<uint32_t>> orbits;
+    for (uint32_t c = 0; c < kMax; ++c) {
+        if (is_surrogate(c)) continue;
+        orbits[find(c)].push_back(c);
+    }
+    std::printf("/* Each orbit is its length followed by its members, ascending. */\n");
+    std::printf("const uint32_t k_case_orbits[] = {\n");
+    size_t w = 0;
+    for (const auto& [rep, members] : orbits) {
+        if (members.size() < 2) continue;
+        std::printf("    %zu,", members.size());
+        for (uint32_t m : members) std::printf(" 0x%X,", m);
+        std::printf("\n");
+        ++w;
+    }
+    std::printf("};\nconst size_t k_case_orbits_n = sizeof(k_case_orbits) / sizeof(k_case_orbits[0]);\n\n");
+    std::printf("const uint32_t k_case_multi[] = {\n");
+    n = 0;
+    for (uint32_t c : multi) {
+        std::printf("%s0x%X,%s", n % 10 == 0 ? "    " : "", c, n % 10 == 9 ? "\n" : " ");
+        ++n;
+    }
+    std::printf("\n};\nconst size_t k_case_multi_n = sizeof(k_case_multi) / sizeof(k_case_multi[0]);\n\n");
+
+    std::printf("}  /* namespace ucd */\n}  /* namespace rad */\n");
+    std::fprintf(stderr, "%zu case orbits, %zu multi-codepoint folds\n", w, multi.size());
+    return 0;
+}

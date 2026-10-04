@@ -1,0 +1,97 @@
+--- a/common/json-schema-to-grammar.cpp
++++ b/common/json-schema-to-grammar.cpp
+@@ -276,12 +276,24 @@ static std::regex GRAMMAR_LITERAL_ESCAPE_RE("[\r\n\"\\\\]");
+ static std::regex GRAMMAR_RANGE_LITERAL_ESCAPE_RE("[\r\n\"\\]\\-\\\\]");
+ static std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
+     {'\r', "\\r"}, {'\n', "\\n"}, {'"', "\\\""}, {'-', "\\-"}, {']', "\\]"}, {'\\', "\\\\"}
+ };
+ 
+ static std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?'};
++
++// RADIANCE: the escapes GBNF can actually spell. Anything else in a pattern is refused rather
++// than copied into a grammar that will not load. See the use site in _visit_pattern.
++static inline bool is_gbnf_escape(char c) {
++    switch (c) {
++        case 'x': case 'u': case 'U': case 't': case 'r': case 'n':
++        case '\\': case '"': case '[': case ']':
++            return true;
++        default:
++            return false;
++    }
++}
+ static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
+ 
+ static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
+     std::smatch match;
+     std::string result;
+ 
+@@ -545,12 +557,24 @@ private:
+                             char next = sub_pattern[i + 1];
+                             if (ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.find(next) != ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.end()) {
+                                 i++;
+                                 literal += sub_pattern[i];
+                                 i++;
+                             } else {
++                                // RADIANCE: GBNF knows \x \u \U \t \r \n \\ \" \[ \] and nothing
++                                // else. Copying an escape it cannot spell (\d \w \s \b \/ \-, a
++                                // backreference) produces a grammar that returns success here and
++                                // then fails to LOAD, which the caller sees as an internal error
++                                // on a schema we told it was fine.
++                                if (!is_gbnf_escape(next)) {
++                                    _errors.push_back(
++                                        std::string("Unsupported regex escape '\\") + next +
++                                        "' in a pattern: GBNF cannot spell it, so the grammar "
++                                        "would not load");
++                                    return std::make_pair(std::string(), true);
++                                }
+                                 literal += sub_pattern.substr(i, 2);
+                                 i += 2;
+                             }
+                         } else if (sub_pattern[i] == '"') {
+                             literal += "\\\"";
+                             i++;
+@@ -791,12 +815,21 @@ public:
+                 for (auto & x : n) {
+                     visit_refs(x);
+                 }
+             } else if (n.is_object()) {
+                 if (n.contains("$ref")) {
+                     std::string ref = n["$ref"];
++                    // RADIANCE: a sampler that reaches the network to decide what tokens are legal
++                    // is not a sampler we will ship. Upstream fetches through an injected callback
++                    // which the public entry point then stubs out to return null -- so a remote
++                    // $ref silently degrades into "accepts any object". Refuse, and fetch nothing.
++                    if (ref.rfind("http://", 0) == 0 || ref.rfind("https://", 0) == 0) {
++                        throw std::runtime_error(
++                            "remote $ref is not supported: '" + ref + "'. Inline the referenced "
++                            "schema; this converter does not fetch over the network.");
++                    }
+                     if (_refs.find(ref) == _refs.end()) {
+                         json target;
+                         if (ref.find("https://") == 0) {
+                             std::string base_url = ref.substr(0, ref.find('#'));
+                             auto it = _refs.find(base_url);
+                             if (it != _refs.end()) {
+@@ -860,12 +893,22 @@ public:
+ 
+     std::string visit(const json & schema, const std::string & name) {
+         json schema_type = schema.contains("type") ? schema["type"] : json();
+         std::string schema_format = schema.contains("format") ? schema["format"].get<std::string>() : "";
+         std::string rule_name = is_reserved_name(name) ? name + "-" : name.empty() ? "root" : name;
+ 
++        // RADIANCE: "not" has no case below, so it falls through to a rule that accepts anything
++        // -- a constraint the caller asked for, did not get, and is not told about. Complementing
++        // a regular language is representable but the blowup is real; refusing beats pretending.
++        if (schema.is_object() && schema.contains("not")) {
++            _errors.push_back("Unsupported schema keyword \"not\": this converter cannot "
++                              "complement a grammar, and accepting the schema without it would "
++                              "silently drop the constraint");
++            return "";
++        }
++
+         if (schema.contains("$ref")) {
+             return _add_rule(rule_name, _resolve_ref(schema["$ref"]));
+         }
+         if (schema.contains("oneOf") || schema.contains("anyOf")) {
+             std::vector<json> alt_schemas = schema.contains("oneOf") ? schema["oneOf"].get<std::vector<json>>() : schema["anyOf"].get<std::vector<json>>();
+             return _add_rule(rule_name, _generate_union_rule(name, alt_schemas));

@@ -1,0 +1,48 @@
+# The service every model file in this directory extends. It holds what any radiance container
+# needs on an AMD host; a model file adds only its container and its flags.
+#
+# Each model takes both cards (--tp 2) and the same port, so run one at a time:
+#   docker compose -f flashnext.yaml up -d        start (it comes back after a reboot)
+#   docker compose -f flashnext.yaml logs -f      follow the log
+#   docker compose -f flashnext.yaml down         stop
+#
+# Settings come from .env beside this file (see .env.example).
+services:
+  radiance:
+    image: ${RADIANCE_IMAGE:-stilldeadcode/radiance:latest}
+    restart: unless-stopped
+    init: true
+    # Host networking: the server binds the host's own addresses, IPv4 and IPv6, with no NAT
+    # between it and a reverse proxy.
+    network_mode: host
+    # The host user, so the prefix cache's files on disk belong to that user and not to root.
+    user: "${RADIANCE_UID:-1000}:${RADIANCE_GID:-1000}"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${RENDER_GID:?set RENDER_GID in .env}"
+      - "${VIDEO_GID:?set VIDEO_GID in .env}"
+    # Docker's default seccomp profile refuses io_uring, which the n-gram table's reads from the
+    # container go through, and the NUMA binding calls (mbind, set_mempolicy) the ROCm runtime
+    # makes for host memory.
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      memlock: -1
+    volumes:
+      - ${RADIANCE_MODELS:?set RADIANCE_MODELS in .env}:/models:ro
+      - ${RADIANCE_STATE:?set RADIANCE_STATE in .env}:/data
+    # A server finishes the step in flight and releases the cards on SIGTERM.
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD", "busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:${PORT:-8000}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15m
+    logging:
+      driver: json-file
+      options:
+        max-size: 100m
+        max-file: "5"

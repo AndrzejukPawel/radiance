@@ -1,0 +1,18 @@
+# minicpm5-2b-bf16-dspark.recipe -- MiniCPM5-2B in bf16 as the checkpoint ships it, with the DSpark
+# drafter merged in (--draft-model). Every weight of the model itself, the lm_head included, is the
+# checkpoint's own; the drafter is quantised as in minicpm5-2b-dspark.recipe, because the DSpark
+# block reads its weights in one form only: block fp8, and the vocabulary head as 2-bit codes (the
+# head only proposes; the model's own bf16 lm_head scores every token it accepts).
+#
+#   rad-convert <MiniCPM5-2B checkpoint> --draft-model <MiniCPM5-2B-DSpark checkpoint> \
+#       --tokenizer <MiniCPM5-2B checkpoint>/tokenizer.json \
+#       --recipe data/recipes/minicpm5-2b-bf16-dspark.recipe -o minicpm5-2b-bf16.rad
+
+dspark.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16
+dspark.fc.weight                     rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.attn_q.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.attn_k.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.attn_v.weight           rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.attn_output.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.ffn_gate_up.weight      rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dspark.blk.*.ffn_down.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16

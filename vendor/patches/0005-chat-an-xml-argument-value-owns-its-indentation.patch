@@ -1,0 +1,46 @@
+diff --git a/common/chat-peg-parser.cpp b/common/chat-peg-parser.cpp
+index 12e747d..111acd0 100644
+--- a/common/chat-peg-parser.cpp
++++ b/common/chat-peg-parser.cpp
+@@ -36,6 +36,31 @@ static std::string_view trim(std::string_view sv) {
+     return trim_trailing_space(trim_leading_space(sv, 1));
+ }
+ 
++// RADIANCE: the delimiter around an XML argument value is a NEWLINE, not "whitespace". The
++// template writes <parameter=old_string>\n    return a + b\n</parameter>, and exactly the first
++// and last newline are punctuation -- everything between them, INCLUDING the indentation, is the
++// value the model meant to send. Stripping "one leading whitespace character" eats the first
++// column of every indented hunk, so an agent's exact-match edit never applies and the model that
++// wrote a perfectly good call gets the blame. Strip the delimiter and nothing else.
++static std::string_view strip_one_leading_newline(std::string_view sv) {
++    if (!sv.empty() && sv.front() == '\n') {
++        sv.remove_prefix(1);
++    } else if (sv.size() >= 2 && sv[0] == '\r' && sv[1] == '\n') {
++        sv.remove_prefix(2);
++    }
++    return sv;
++}
++
++static std::string_view strip_one_trailing_newline(std::string_view sv) {
++    if (!sv.empty() && sv.back() == '\n') {
++        sv.remove_suffix(1);
++        if (!sv.empty() && sv.back() == '\r') {
++            sv.remove_suffix(1);
++        }
++    }
++    return sv;
++}
++
+ // Count the number of unclosed '{' braces in a JSON-like string,
+ // properly skipping braces inside quoted strings.
+ static int json_brace_depth(const std::string & s) {
+@@ -338,7 +363,8 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
+     }
+ 
+     if ((is_arg_value || is_arg_string_value) && current_tool) {
+-        std::string value_content = std::string(trim_trailing_space(trim_leading_space(node.text, 1), 1));
++        std::string value_content =
++            std::string(strip_one_trailing_newline(strip_one_leading_newline(node.text)));
+ 
+         std::string value_to_add;
+         if (value_content.empty() && is_arg_string_value) {

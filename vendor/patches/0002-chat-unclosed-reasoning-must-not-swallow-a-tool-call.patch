@@ -1,0 +1,109 @@
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index db3a6cc..ed895b5 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -121,13 +121,25 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
+         ctx.content              = &content;
+         ctx.reasoning            = &reasoning;
+ 
++        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
++        bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
++
++        // RADIANCE: tell the reasoning parser where a tool call starts, so an unclosed reasoning
++        // block cannot swallow one. This is the same marker the tool parsers below use to split
++        // content from calls, computed here because only this scope can see both analyzers.
++        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE && jinja_caps.supports_tool_calls) {
++            const std::string & marker = !tools.format.section_start.empty()
++                                             ? tools.format.section_start
++                                             : tools.format.per_call_start;
++            if (!marker.empty()) {
++                ctx.reasoning_terminators.push_back(marker);
++            }
++        }
++
+         // Build reasoning parser
+         ctx.reasoning_parser = reasoning.build_parser(ctx);
+ 
+         auto parser = p.eps();
+-
+-        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+-        bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+         bool pure_content        = reasoning.mode == reasoning_mode::NONE;
+ 
+         if (has_response_format) {
+@@ -156,12 +168,57 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
+ 
+     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
+         if (!end.empty()) {
++            const std::string trimmed_end = trim_whitespace(end);
++
++            // RADIANCE: `until(end)` runs to the END OF THE INPUT when the closing tag never
++            // arrives, so a reasoning block the model forgot to close swallowed the entire
++            // reply -- including a <tool_call> written from inside it, which meant the call was
++            // parsed as reasoning text and LOST. The turn then carried no tool call and no
++            // content, and an agent driving it simply stopped. Templates in the wild carry
++            // explicit self-heals for this shape, which is how we know models emit it.
++            //
++            // The repair is an ORDERED CHOICE whose first branch is GUARDED BY A LOOKAHEAD, so
++            // it can only win in the one situation it was written for. The unclosed branch runs
++            // `until` over both the closing tag and the tool-call opener and then REQUIRES, on a
++            // peek that consumes nothing, that what stopped it was the opener. So:
++            //
++            //   reasoning </think> <tool_call>   -> stops at </think>, peek fails, upstream rule
++            //   reasoning <tool_call>            -> stops at the opener, peek holds, call parsed
++            //   reasoning, no tag, no call       -> runs to EOF, peek fails, upstream rule
++            //
++            // The guard is what makes this additive: every reply that closes its reasoning block
++            // takes the second branch, which is upstream's rule byte for byte. It also keeps
++            // reasoning that merely MENTIONS an opener on the upstream path, because such a reply
++            // still has its closing tag and the peek therefore never fires.
++            //
++            // Ordering matters and is not free to swap: `until` returns "need more input" rather
++            // than failing when it reaches the end of the input, so a closed branch placed first
++            // would short-circuit before its required closing literal was ever checked, and the
++            // unclosed branch would be unreachable. That is the bug this comment cost.
++            if (!ctx.reasoning_terminators.empty()) {
++                std::vector<std::string> stops = ctx.reasoning_terminators;
++                stops.insert(stops.begin(), trimmed_end);
++
++                std::vector<common_peg_parser> openers;
++                openers.reserve(ctx.reasoning_terminators.size());
++                for (const auto & t : ctx.reasoning_terminators) {
++                    openers.push_back(p.literal(t));
++                }
++                auto unclosed = p.reasoning(p.until_one_of(stops)) + p.peek(p.choice(openers));
++                auto closed   = p.reasoning(p.until(trimmed_end)) + p.optspace(end);
++                if (!start.empty()) {
++                    return p.optional(p.choice({ p.optspace(start) + unclosed,
++                                                 p.optspace(start) + closed }));
++                }
++                return p.optional(p.choice({ unclosed, closed }));
++            }
++
+             if (!start.empty()) {
+                 // Standard tag-based: optional(<think>reasoning</think>)
+-                return p.optional(p.optspace(start) + p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
++                return p.optional(p.optspace(start) + p.reasoning(p.until(trimmed_end)) + p.optspace(end));
+             }
+             // Delimiter-style (empty start)
+-            return p.optional(p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
++            return p.optional(p.reasoning(p.until(trimmed_end)) + p.optspace(end));
+         }
+     }
+ 
+diff --git a/common/chat-auto-parser.h b/common/chat-auto-parser.h
+index 7858f65..478edef 100644
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -228,6 +228,11 @@ struct parser_build_context {
+     const analyze_reasoning *         reasoning            = nullptr;
+     const analyze_content *           content              = nullptr;
+ 
++    // RADIANCE: markers that end an UNCLOSED reasoning block, in addition to its closing tag --
++    // in practice the tool-call opener. Empty unless this turn can call tools. See the comment
++    // in analyze_reasoning::build_parser for what goes wrong without it.
++    std::vector<std::string>          reasoning_terminators;
++
+     parser_build_context(common_chat_peg_builder & p, const generation_params & inputs);
+ };
+ 
