@@ -24,6 +24,15 @@ int64_t to_mib(int64_t bytes) { return bytes > 0 ? bytes / kMiB : 0; }
 int64_t to_mib_up(int64_t bytes) { return bytes > 0 ? (bytes + kMiB - 1) / kMiB : 0; }
 }  /* namespace */
 
+/* WHAT THE CACHE BACKS, counted on its PAGED part. The ceiling is the recurrent and conv state of
+ * max_seqs sequences plus their context, and the state is spent before a single token is cached --
+ * on a hybrid model at a few dozen sequences it is gigabytes a card. A ratio over the whole
+ * ceiling counts that state as context and reports full-length sessions the cache cannot hold. */
+static double paged_share(const VramBudget& b) {
+    const double ctx = (double)(b.kv_ceiling - b.kv_fixed);
+    return ctx > 0 ? std::max(0.0, (double)(b.kv - b.kv_fixed)) / ctx : 0.0;
+}
+
 int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out) {
     VramBudget b;
     if (per_rank.empty()) { if (out) *out = b; return RAD_OK; }
@@ -39,7 +48,9 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
         b.capacity   = std::min(b.capacity, f.capacity);
         freeb        = std::min(freeb, f.free);
         b.arena      = std::max(b.arena, f.arena);
+        b.staging    = std::max(b.staging, f.staging);
         b.kv_ceiling = std::max(b.kv_ceiling, f.kv_ceiling);
+        b.kv_fixed   = std::max(b.kv_fixed, f.kv_fixed);
         b.statics    = std::max(b.statics, f.statics);
         b.expert_ceiling = std::max(b.expert_ceiling, f.experts);
         layer_max        = std::max(layer_max, f.expert_layer_max);
@@ -72,7 +83,7 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
     b.derived_kv      = want_kv;
 
     /* What is left after the terms nobody gets to spend. */
-    int64_t fixed = b.already_held + b.headroom + b.arena;
+    int64_t fixed = b.already_held + b.headroom + b.arena + b.staging;
     if (!want_w)  fixed += cfg.vram_weights_mib * kMiB;   /* a stated pool is fixed too */
     if (!want_kv) fixed += cfg.vram_kv_mib * kMiB;
     b.claimable = b.capacity - fixed;
@@ -84,13 +95,14 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
             "  already held       %10s   (driver context, code objects, anything else on the card)\n"
             "  --gpu-headroom-mib %10s\n"
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
+            "  step staging       %10s   (block tables + media staging)\n"
             "%s%s"
             "  ------------------------------\n"
             "  SHORT BY           %10s\n"
             "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
             "or free the card.\n",
             humanb(b.capacity).c_str(), humanb(b.already_held).c_str(),
-            humanb(b.headroom).c_str(), humanb(b.arena).c_str(),
+            humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             want_w  ? "" : fmt("  --vram-weights-mib %10s   (stated)\n",
                                humanb(cfg.vram_weights_mib * kMiB).c_str()).c_str(),
             want_kv ? "" : fmt("  --vram-kv-mib      %10s   (stated)\n",
@@ -223,9 +235,9 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
                  "live SESSIONS and not running requests -- when they do not all fit, the cache "
                  "evicts prefixes the next turn wanted and that turn re-prefills its whole "
                  "context. --expert-vs-cache-ratio moves it.",
-                 100.0 * (double)b.kv / (double)b.kv_ceiling,
+                 100.0 * paged_share(b),
                  (long long)cfg.max_seqs, (long long)cfg.max_ctx,
-                 (double)cfg.max_seqs * (double)b.kv / (double)b.kv_ceiling);
+                 (double)cfg.max_seqs * paged_share(b));
     /* Rounding the floor up claims up to a MiB the split did not hand out. Take it back from the
      * cache where the cache is ours to size -- a paged pool a MiB smaller addresses a handful
      * fewer tokens and nothing else -- so the headroom stays whole. Where the KV budget was
@@ -240,13 +252,14 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
      * line is not padding: to_mib truncates, and what it drops is real VRAM that ends up beside
      * the headroom. */
     const int64_t granted   = cfg.vram_weights_mib * kMiB + cfg.vram_kv_mib * kMiB;
-    const int64_t unclaimed = b.capacity - b.already_held - b.arena - b.stage - granted;
+    const int64_t unclaimed = b.capacity - b.already_held - b.arena - b.staging - b.stage - granted;
     const double  ela       = b.elastic > 0 ? (double)b.elastic : 1.0;
     b.report = fmt(
         "VRAM budget, per card:\n"
         "  card total         %10s\n"
         "  already held       %10s   measured: driver context, code objects, anything else resident\n"
         "  activation arena   %10s   computed from the buffer plan\n"
+        "  step staging       %10s   the step batch's block tables and media staging\n"
         "  %-18s %10s   %s\n"
         "  ------------------------------\n"
         "  claimable          %10s\n"
@@ -263,6 +276,7 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
         "  unclaimed          %10s   the headroom, the unusable above, and what MiB rounding\n"
         "                                  could not place\n",
         humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.arena).c_str(),
+        humanb(b.staging).c_str(),
         shared ? "left to the host" : "--gpu-headroom-mib", humanb(b.headroom).c_str(),
         shared ? "integrated graphics: this memory is the host's; --vram-kv-mib states a pool "
                  "outright"
@@ -302,9 +316,9 @@ int vram_budget_resolve(Config& cfg, const std::vector<VramFacts>& per_rank, Vra
                          "finished sequence's blocks stay held\n"
                          "                                  for reuse, so the demand is LIVE "
                          "SESSIONS and not running requests",
-                         100.0 * (double)b.kv / (double)b.kv_ceiling,
+                         100.0 * paged_share(b),
                          (long long)cfg.max_seqs, (long long)cfg.max_ctx,
-                         (double)cfg.max_seqs * (double)b.kv / (double)b.kv_ceiling).c_str()
+                         (double)cfg.max_seqs * paged_share(b)).c_str()
                    : ""),
         b.unusable > 0
             ? fmt("    unusable         %10s   neither side could take it: both are at their "

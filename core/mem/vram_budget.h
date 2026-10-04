@@ -60,7 +60,9 @@ struct VramFacts {
     int64_t capacity   = 0;   /* RadDeviceProps::vram_bytes -- totalGlobalMem */
     int64_t free       = 0;   /* RadDeviceProps::vram_free, measured now */
     int64_t arena      = 0;   /* arena_plan_bytes() for this rank's program, total incl. scratch */
+    int64_t staging    = 0;   /* BatchBuilder::device_bytes(): the step slab and the media staging */
     int64_t kv_ceiling = 0;   /* KVManager::ceiling(max_ctx) for this rank's declared groups */
+    int64_t kv_fixed   = 0;   /* KVManager::fixed_bytes(): the part of the ceiling that is state */
     /* weight_footprint() for this rank, which under tensor parallel is already this card's even
      * share: declare runs per rank with every dimension already divided. */
     int64_t statics    = 0;   /* non-expert weights -- the floor, not a share of anything */
@@ -75,11 +77,12 @@ struct VramFacts {
 /* The resolved split, in bytes, beside every term it came from. Always filled, including when the
  * operator stated the budgets -- the placement report and the pool report both want the totals. */
 struct VramBudget {
-    int64_t capacity = 0, already_held = 0, headroom = 0, arena = 0;
-    int64_t claimable = 0;            /* after the four fixed terms above */
+    int64_t capacity = 0, already_held = 0, headroom = 0, arena = 0, staging = 0;
+    int64_t claimable = 0;            /* after the fixed terms above */
     int64_t statics = 0;              /* off the top, before the ratio sees anything */
     int64_t elastic = 0;              /* claimable - statics: what the ratio divides */
     int64_t kv_ceiling = 0, expert_ceiling = 0;
+    int64_t kv_fixed = 0;             /* the state part of kv_ceiling, which no context uses */
     int64_t experts = 0, kv = 0;      /* the two shares, each capped at its ceiling */
     int64_t unusable = 0;             /* elastic neither side could take -- both were full */
     /* THE PREFILL STAGING REGION: two buffers, each one layer's share of the experts the budget

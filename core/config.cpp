@@ -84,6 +84,7 @@ static const Flag g_flags[] = {
     { "--host",               "ADDR",   "listen address" },
     { "--port",               "N",      "listen port" },
     { "--api-key",            "KEY",    "require `Authorization: Bearer KEY` on every request but /health, /ping and the dashboard page" },
+    { "--served-model-name",  "NAME",   "the model id /v1/models lists and responses carry; default the container's name" },
     { "--mm-max-patches",     "N",      "patches one encoder pass carries, and so the largest image (a patch is 16x16\n"
                                         "pixels). Default `auto`: 16384 when the container carries a vision tower. 0\n"
                                         "serves text only and keeps the tower off the card" },
@@ -91,6 +92,7 @@ static const Flag g_flags[] = {
     "                                    for requests that send none. Without it the container's own\n"
     "                                    `generation.*` metadata is used, then a <model>.generation.json\n"
     "                                    beside the container, then the built-in defaults" },
+    { "--override-chat-template", "PATH", "a Jinja chat template file, used in place of the one the container carries" },
     { "--temp",               "F",      "default temperature for requests that do not set one" },
     { "--top-k",              "N",      "default top_k (0 = off) for requests that do not set one" },
     { "--top-p",              "F",      "default top_p for requests that do not set one" },
@@ -267,6 +269,11 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--host"))                  { if (!(v = need(i))) return RAD_E_INVAL; c->host = v; }
         else if (S("--port"))                  { if (!(v = need(i))) return RAD_E_INVAL; c->port = atoi(v); }
         else if (S("--api-key"))               { if (!(v = need(i))) return RAD_E_INVAL; c->api_key = v; }
+        else if (S("--served-model-name")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!*v) { RAD_ERR("--served-model-name takes a non-empty name"); return RAD_E_INVAL; }
+            c->served_model_name = v;
+        }
         else if (S("--mm-max-patches")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (!std::strcmp(v, "auto")) c->mm_max_patches = -1;
@@ -284,6 +291,8 @@ int config_parse(int argc, char** argv, Config* c) {
                                                  c->reasoning_effort = v; }
         else if (S("--generation-config"))     { if (!(v = need(i))) return RAD_E_INVAL;
                                                  c->generation_config = v; }
+        else if (S("--override-chat-template")) { if (!(v = need(i))) return RAD_E_INVAL;
+                                                 c->override_chat_template = v; }
         /* A NEGATIVE VALUE IS REFUSED HERE, not left to the range checks below: the fields use
          * a negative number to mean "not set", so `--temp -0.5` would otherwise be read as no
          * flag at all and the container's default served in its place. */

@@ -1,0 +1,142 @@
+diff --git a/common/chat-auto-parser-generator.cpp b/common/chat-auto-parser-generator.cpp
+index b682578..71520db 100644
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -447,6 +447,17 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
+         for (const auto & [param_name, param_schema] : properties.items()) {
+             bool is_required = required.find(param_name) != required.end();
+ 
++            /* RADIANCE: AN OPTIONAL ARGUMENT NO VALUE SATISFIES IS ONE NO CALL WRITES -- an
++             * Arktype "never", exported as `{"not": {}}` (oh-my-pi's `task` tool declares its batch
++             * form's `model` so). It gets no arm: a schema-checked arm for it is a grammar for a
++             * value that does not exist, and the converter refuses to build one. A model that
++             * writes it anyway reaches the undeclared-argument arm below, as any name outside the
++             * schema does, and the tool says what is wrong. Required, it goes through the schema
++             * and is refused there by name. */
++            if (!is_required && schema_info.unsatisfiable(param_schema)) {
++                continue;
++            }
++
+             /* RADIANCE: A NON-STRING ARGUMENT THAT IS NOT VALID JSON IS STILL AN ARGUMENT.
+              *
+              * An array or object parameter is matched by a schema-constrained JSON parser, and
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 1398152..5bc91eb 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1955,6 +1955,11 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
+             std::vector<common_peg_parser> optional_parsers;
+             for (const auto & [param_name, param_schema] : props.items()) {
+                 bool is_required = required.find(param_name) != required.end();
++                // RADIANCE: an optional argument no value satisfies is one no call writes, so it
++                // gets no arm (see chat-auto-parser-generator.cpp); required, it is refused by name.
++                if (!is_required && schema_info.unsatisfiable(param_schema)) {
++                    continue;
++                }
+                 bool is_string   = schema_info.resolves_to_string(param_schema);
+ 
+                 auto arg = p.tool_arg(
+diff --git a/common/json-schema-to-grammar.cpp b/common/json-schema-to-grammar.cpp
+index ccf857a..95640fb 100644
+--- a/common/json-schema-to-grammar.cpp
++++ b/common/json-schema-to-grammar.cpp
+@@ -697,6 +697,19 @@ private:
+             const auto &prop_name = kv.first;
+             const auto &prop_schema = kv.second;
+ 
++            // RADIANCE: a property no value satisfies is a key the object never carries, which the
++            // grammar states exactly by having no rule for it. Its name stays in prop_names, so an
++            // additionalProperties rule cannot readmit the key with a value of its own. Required,
++            // it makes the whole object unsatisfiable, and that is refused.
++            if (is_unsatisfiable(prop_schema)) {
++                if (required.find(prop_name) != required.end()) {
++                    _errors.push_back("Property \"" + prop_name + "\" is required, but its schema "
++                                      "accepts no value");
++                }
++                prop_names.push_back(prop_name);
++                continue;
++            }
++
+             std::string prop_rule_name = visit(prop_schema, name + (name.empty() ? "" : "-") + prop_name);
+             prop_kv_rule_names[prop_name] = _add_rule(
+                 name + (name.empty() ? "" : "-") + prop_name + "-kv",
+@@ -887,6 +900,17 @@ public:
+         visit_refs(schema);
+     }
+ 
++    // RADIANCE: the schema no value satisfies. JSON Schema spells it `false`, and `{"not": {}}` --
++    // which is how TypeBox's Type.Never and Arktype's "never" are exported, the latter as an
++    // optional property no call may set. A `not` of the empty schema makes its whole schema
++    // unsatisfiable whatever sits beside it, so the sibling keywords do not matter.
++    static bool is_unsatisfiable(const json & schema) {
++        if (schema.is_boolean()) return !schema.get<bool>();
++        if (!schema.is_object() || !schema.contains("not")) return false;
++        const json & n = schema["not"];
++        return (n.is_object() && n.empty()) || (n.is_boolean() && n.get<bool>());
++    }
++
+     static std::string _generate_constant_rule(const json & value) {
+         return format_literal(value.dump());
+     }
+@@ -896,9 +920,19 @@ public:
+         std::string schema_format = schema.contains("format") ? schema["format"].get<std::string>() : "";
+         std::string rule_name = is_reserved_name(name) ? name + "-" : name.empty() ? "root" : name;
+ 
+-        // RADIANCE: "not" has no case below, so it falls through to a rule that accepts anything
+-        // -- a constraint the caller asked for, did not get, and is not told about. Complementing
+-        // a regular language is representable but the blowup is real; refusing beats pretending.
++        // RADIANCE: an unsatisfiable schema in a place that must hold a value -- the root, an array's
++        // items, a $ref target -- has no grammar: GBNF has no empty language to give it. An object
++        // property and a union alternative of this kind are handled where they occur.
++        if (is_unsatisfiable(schema)) {
++            _errors.push_back("Schema \"" + (name.empty() ? std::string("root") : name) + "\" accepts no "
++                              "value, where a value is required");
++            return "";
++        }
++
++        // RADIANCE: any other "not" has no case below, so it would fall through to a rule that
++        // accepts anything -- a constraint the caller asked for, did not get, and is not told
++        // about. Complementing a regular language is representable but the blowup is real;
++        // refusing beats pretending.
+         if (schema.is_object() && schema.contains("not")) {
+             _errors.push_back("Unsupported schema keyword \"not\": this converter cannot "
+                               "complement a grammar, and accepting the schema without it would "
+@@ -911,6 +945,14 @@ public:
+         }
+         if (schema.contains("oneOf") || schema.contains("anyOf")) {
+             std::vector<json> alt_schemas = schema.contains("oneOf") ? schema["oneOf"].get<std::vector<json>>() : schema["anyOf"].get<std::vector<json>>();
++            // RADIANCE: an alternative no value satisfies contributes nothing to the union.
++            alt_schemas.erase(std::remove_if(alt_schemas.begin(), alt_schemas.end(), is_unsatisfiable),
++                              alt_schemas.end());
++            if (alt_schemas.empty()) {
++                _errors.push_back("Schema \"" + (name.empty() ? std::string("root") : name) + "\": no "
++                                  "alternative of its union accepts a value");
++                return "";
++            }
+             return _add_rule(rule_name, _generate_union_rule(name, alt_schemas));
+         }
+         if (schema_type.is_array()) {
+@@ -1108,6 +1150,10 @@ void common_schema_info::resolve_refs(nlohmann::ordered_json & schema) {
+     impl_->resolve_refs(schema, "");
+ }
+ 
++bool common_schema_info::unsatisfiable(const nlohmann::ordered_json & schema) const {
++    return common_schema_converter::is_unsatisfiable(schema);
++}
++
+ // Determines if a JSON schema can resolve to a string type through any path.
+ // Some models emit raw string values rather than JSON-encoded strings for string parameters.
+ // If any branch of the schema (via oneOf, anyOf, $ref, etc.) permits a string, this returns
+diff --git a/common/json-schema-to-grammar.h b/common/json-schema-to-grammar.h
+index 240d642..86c78f3 100644
+--- a/common/json-schema-to-grammar.h
++++ b/common/json-schema-to-grammar.h
+@@ -26,6 +26,8 @@ class common_schema_info {
+ 
+     void resolve_refs(nlohmann::ordered_json & schema);
+     bool resolves_to_string(const nlohmann::ordered_json & schema);
++    // RADIANCE: whether no value satisfies the schema -- `false`, or `{"not": {}}`.
++    bool unsatisfiable(const nlohmann::ordered_json & schema) const;
+ };
+ 
+ struct common_grammar_builder {

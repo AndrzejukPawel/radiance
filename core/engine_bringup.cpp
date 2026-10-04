@@ -26,6 +26,8 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
@@ -445,12 +447,20 @@ int Engine::declare() {
                                                nullptr, sources());
         });
     }
-    if (cfg_.tp > 1 && !cfg_.tp_wire_exact)
-        RAD_WARN("tp wire: LOSSY (--tp-wire wht6) above %lld KiB a message. A cross-rank "
-                 "all-reduce at or over that size carries a Walsh-Hadamard-rotated 6-bit payload "
-                 "instead of bf16, so this process does not compute the same function the exact "
-                 "wire does; smaller messages -- which is every decode step -- are still exact.",
-                 (long long)cfg_.tp_wire_min_kb);
+    /* A message is a step's rows of the residual stream in bf16, so the floor is a ROW COUNT: a
+     * decode step's rows are its sequences times one plus the speculative depth, and concurrency
+     * alone decides whether a decode step is under it. */
+    if (cfg_.tp > 1 && !cfg_.tp_wire_exact) {
+        const int64_t row_bytes = meta_.n_embd > 0 ? meta_.n_embd * 2 : 1;
+        const int64_t exact_rows = (cfg_.tp_wire_min_kb * 1024 + row_bytes - 1) / row_bytes - 1;
+        RAD_WARN("tp wire: LOSSY (--tp-wire wht6) at %lld KiB a message and above. A cross-rank "
+                 "all-reduce of that size carries a Walsh-Hadamard-rotated 6-bit payload instead "
+                 "of bf16, so this process does not compute the same function the exact wire "
+                 "does. Steps of at most %lld rows are exact: single-sequence decode, and a "
+                 "decode step until sequences x (1 + speculative depth) passes that; prefill and "
+                 "a busy decode step are lossy. --tp-wire-min-kb moves the floor.",
+                 (long long)cfg_.tp_wire_min_kb, (long long)exact_rows);
+    }
 
     for (auto& t : th) t.join();
 
@@ -677,8 +687,21 @@ int Engine::plan() {
              * no memory and no pool; it is the half of configure() that is pure arithmetic on the
              * declaration, split out for exactly this caller. */
             KVManager probe;
-            if (probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK)
+            if (probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
                 f.kv_ceiling = probe.ceiling(ctx);
+                f.kv_fixed   = probe.fixed_bytes();
+            }
+            /* THE STEP BATCH'S DEVICE STAGING, which the scheduler reserves after this split: its
+             * block tables are carved for max_seqs sequences at max_ctx and its media staging for
+             * max_tok encoder rows. The state-index widths are the probe's, as the scheduler takes
+             * them from the configured manager. */
+            KVGeom kg = KVGeom::of(r->program.kv_groups);
+            for (size_t i = 0; i < kg.g.size(); ++i) {
+                const int64_t w = probe.state_index_width((int32_t)i);
+                if (w > 0) kg.g[i].sidx_width = w;
+            }
+            f.staging = BatchBuilder::device_bytes(r->program, cfg_, kg);
+            if (f.staging < 0) return RAD_E_INVAL;
             facts.push_back(f);
         }
         VramBudget vb;
@@ -2816,6 +2839,34 @@ int Engine::load_vocab() {
             RAD_ERR("%s: no readable tokenizer.json beside the checkpoint", cfg_.model.c_str());
             return RAD_E_FORMAT;
         }
+    }
+
+    /* THE OPERATOR'S TEMPLATE REPLACES THE CONTAINER'S before anything reads it, so the chat
+     * endpoint and the reply format derived from the template agree about which one is served. An
+     * unreadable or empty file is refused: serving the container's template in its place would be
+     * the silent fallback the flag exists to rule out. */
+    if (!cfg_.override_chat_template.empty()) {
+        std::ifstream f(cfg_.override_chat_template);
+        if (!f) {
+            RAD_ERR("--override-chat-template %s: cannot read the file",
+                    cfg_.override_chat_template.c_str());
+            return RAD_E_IO;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        std::string t = ss.str();
+        /* Trailing newlines go, as they do for a checkpoint's own chat_template.jinja, so one file
+         * renders the same prompt whichever way it reaches the server. */
+        while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+        if (t.find_first_not_of(" \t\r\n") == std::string::npos) {
+            RAD_ERR("--override-chat-template %s: the file is empty",
+                    cfg_.override_chat_template.c_str());
+            return RAD_E_INVAL;
+        }
+        RAD_INFO("chat: template from %s (%zu bytes), in place of the container's%s",
+                 cfg_.override_chat_template.c_str(), t.size(),
+                 vb.chat_template.empty() ? ", which carries none" : "");
+        vb.chat_template = std::move(t);
     }
 
     auto v = std::make_shared<Vocab>();

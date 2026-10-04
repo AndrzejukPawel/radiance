@@ -177,7 +177,7 @@ void BatchBuilder::carve(Set& s, char* h) {
     s.dev_bytes  = od;
 }
 
-int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
+void BatchBuilder::size_set(Set& s, const std::vector<KVGroupInfo>& groups) {
     s.groups.resize(groups.size());
     for (size_t gi = 0; gi < groups.size(); ++gi) {
         const KVGeom::G& e = kvgeom_.g[gi];
@@ -192,8 +192,11 @@ int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
         s.groups[gi].max_blocks = mb;
         s.groups[gi].sidx_pitch = e.sidx_width > 0 ? e.sidx_width : 1;
     }
-
     carve(s, nullptr);
+}
+
+int BatchBuilder::alloc_set(Set& s, const std::vector<KVGroupInfo>& groups) {
+    size_set(s, groups);
 
     /* ONE SLAB PER RANK, on that rank's card. rad_dev_alloc has no device argument and uses the
      * current one, so the bind is part of the allocation. */
@@ -340,6 +343,43 @@ int BatchBuilder::init(Program& prog, const Config& cfg, const ChunkGeometry& ge
      * buffer would have no arena to land in. */
     for (const RankIO& r : ranks_)
         if (!r.prog) return RAD_E_INVAL;
+    RAD_TRY(layout(prog, cfg));
+    RAD_TRY(alloc_set(set_, prog.kv_groups));
+    out_next_ = 0;
+    out_last_ = -1;
+    if (mm_on_) RAD_TRY(alloc_media());
+
+    /* THE RESERVATION AND WHAT ACTUALLY CROSSES ARE DIFFERENT NUMBERS, so the line says both.
+     * Nearly all of the slab is block-table rectangles carved for the worst step, and a step
+     * copies only the rows it filled -- an operator reading the reservation alone would price
+     * the per-step cost far above what it is. */
+    RAD_INFO("step batch: %s pinned staging ring + %s device slab a rank, %d KV group(s), "
+             "%d derived buffer(s); of the slab, %s is block tables carved for the worst step "
+             "and only the filled rows cross",
+             humanb(ring_.bytes).c_str(), humanb(set_.dev_bytes).c_str(),
+             (int)prog.kv_groups.size(), (int)derived_.size(),
+             humanb(set_.dev_bytes - set_.bt_base).c_str());
+    return RAD_OK;
+}
+
+/* WHAT init() WILL ALLOCATE ON EVERY RANK'S CARD, before any of it exists: the VRAM budget is
+ * resolved before the builder is, and a reservation it does not charge comes out of
+ * --gpu-headroom-mib -- the room a kernel's first launch allocates from, where running out is a
+ * fault inside the HIP runtime rather than an error. The slab's block tables grow with
+ * --max-num-seqs and the media staging with --max-num-batched-tokens, so neither is small enough
+ * to leave to the headroom. The same layout() and carve walk as init(), so the two cannot drift. */
+int64_t BatchBuilder::device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg) {
+    BatchBuilder b;
+    b.prog_ = &prog;
+    b.cfg_ = cfg;
+    b.kvgeom_ = kvg;
+    if (b.layout(prog, cfg) < 0) return -1;
+    b.size_set(b.set_, prog.kv_groups);
+    const MediaBytes m = b.mm_on_ ? b.media_bytes() : MediaBytes{};
+    return b.set_.dev_bytes + m.mm + m.pix + m.crd + m.cu;
+}
+
+int BatchBuilder::layout(Program& prog, const Config& cfg) {
     max_tok_ = cfg.max_tok;
     max_seqs_ = cfg.max_seqs;
 
@@ -456,36 +496,28 @@ int BatchBuilder::init(Program& prog, const Config& cfg, const ChunkGeometry& ge
               });
 
     mm_on_ = prog.encoder.modalities != 0;
-    RAD_TRY(alloc_set(set_, prog.kv_groups));
-    out_next_ = 0;
-    out_last_ = -1;
-    if (mm_on_) RAD_TRY(alloc_media());
-
-    /* THE RESERVATION AND WHAT ACTUALLY CROSSES ARE DIFFERENT NUMBERS, so the line says both.
-     * Nearly all of the slab is block-table rectangles carved for the worst step, and a step
-     * copies only the rows it filled -- an operator reading the reservation alone would price
-     * the per-step cost far above what it is. */
-    RAD_INFO("step batch: %s pinned staging ring + %s device slab a rank, %d KV group(s), "
-             "%d derived buffer(s); of the slab, %s is block tables carved for the worst step "
-             "and only the filled rows cross",
-             humanb(ring_.bytes).c_str(), humanb(set_.dev_bytes).c_str(),
-             (int)prog.kv_groups.size(), (int)derived_.size(),
-             humanb(set_.dev_bytes - set_.bt_base).c_str());
     return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ media staging */
-int BatchBuilder::alloc_media() {
+BatchBuilder::MediaBytes BatchBuilder::media_bytes() {
     const RadEncoderDecl& e = prog_->encoder;
     n_embd_ = e.n_embd;
     enc_patches_ = e.max_patches;
     enc_dim_ = e.patch_dim;
     /* The most segments one pass can hold: a segment is at least one output row, `merge` patches. */
     enc_segs_ = e.max_patches / (e.merge > 0 ? e.merge : 1) + 1;
-    const int64_t mm_bytes  = max_tok_ * n_embd_ * (int64_t)sizeof(uint16_t);
-    const int64_t pix_bytes = enc_patches_ * enc_dim_ * (int64_t)sizeof(uint16_t);
-    const int64_t crd_bytes = 4 * enc_patches_ * (int64_t)sizeof(int32_t);
-    const int64_t cu_bytes  = (enc_segs_ + 1) * (int64_t)sizeof(int32_t);
+    MediaBytes m;
+    m.mm  = max_tok_ * n_embd_ * (int64_t)sizeof(uint16_t);
+    m.pix = enc_patches_ * enc_dim_ * (int64_t)sizeof(uint16_t);
+    m.crd = 4 * enc_patches_ * (int64_t)sizeof(int32_t);
+    m.cu  = (enc_segs_ + 1) * (int64_t)sizeof(int32_t);
+    return m;
+}
+
+int BatchBuilder::alloc_media() {
+    const MediaBytes m = media_bytes();
+    const int64_t mm_bytes = m.mm, pix_bytes = m.pix, crd_bytes = m.crd, cu_bytes = m.cu;
     mm_dev_.assign(ranks_.size(), nullptr);
     enc_pix_dev_.assign(ranks_.size(), nullptr);
     enc_coord_dev_.assign(ranks_.size(), nullptr);

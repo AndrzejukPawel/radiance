@@ -573,22 +573,30 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
         rad_op_writes(b, h, wr, fold ? 4 : 3);
         return h;
     };
-    for (int64_t l = 0; l < g.n_layer; ++l) {
-        const int i = (int)l;
-        op_anorm[i] = decl_norm(w_anorm[i], i != 0);
-        op_fnorm[i] = decl_norm(w_fnorm[i], true);
-        if (!op_anorm[i] || !op_fnorm[i]) return RAD_E_INVAL;
-    }
-    op_outnorm = decl_norm(w_norm, true);
     op_qat = rw(b, RAD_OP(b, "quant_act_fp8",
                    RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n", qd),
                               RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                    RAD_NOWEIGHTS),
                {w.attn.x}, {w.attn.q, w.attn.s});
-    if (!op_outnorm || !op_qat) return RAD_E_INVAL;
+    if (!op_qat) return RAD_E_INVAL;
 
+    /* THE NORMS ARE DECLARED WHERE step() ISSUES THEM, because declaration order is the buffer
+     * planner's liveness: a transient lives over the op indices that touch it, and two whose spans
+     * are disjoint may share bytes (core/build/rad_bufplan.cpp). The stream `x` and the norm
+     * outputs `h` are live across every layer, and the norms are the only ops that touch the
+     * stream after the embedding, so their positions are the stream's lifetime. Each layer's two
+     * norms sit inside the loop and the final one after every op the layers issue -- the shared
+     * rope, store, silu_mul and quantiser handles below included.
+     *
+     * Declared together ahead of the layers, the stream's lifetime ended before the first layer's
+     * temporaries began, and the packer put a feed-forward temporary on top of it. The fused gated
+     * GEMM never writes those, so the overlap stayed silent up to 64 rows a pass; past 64 the
+     * unfused pair writes `gate_up` and `ffn.x`, and every draft was rejected from the tenth
+     * sequence on. */
     for (int64_t l = 0; l < g.n_layer; ++l) {
         const int i = (int)l;
+        op_anorm[i] = decl_norm(w_anorm[i], i != 0);
+        if (!op_anorm[i]) return RAD_E_INVAL;
         op_qp[i] = rw(b, RAD_OP(b, "gemm_nt_q",
                          RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", qd),
                                     RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
@@ -625,6 +633,8 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                                     RAD_STR("dtype", "fp8a8")),
                          RAD_WEIGHTS(w_o[i].w, w_o[i].s)),
                      {w.attn.q, w.attn.s}, {w.h.x});
+        op_fnorm[i] = decl_norm(w_fnorm[i], true);
+        if (!op_fnorm[i]) return RAD_E_INVAL;
         op_gu[i] = rw(b, RAD_OP(b, "gemm_nt_q",
                          RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("N", 2 * g.n_ff),
                                     RAD_INT("K", g.n_embd), RAD_INT("group", RAD_FP8_BLOCK),
@@ -701,6 +711,8 @@ inline int Dspark::declare(RadBuilder* b, Names& nm, const Geom& geom, const Con
                                  RAD_INT("min_bytes", g.wire_min_bytes)),
                       RAD_NOWEIGHTS),
                   {w.h.x}, {w.h.x});
+    op_outnorm = decl_norm(w_norm, true);
+    if (!op_outnorm) return RAD_E_INVAL;
 
     /* ---------------------------------------------------------------- the head and the walk
      *

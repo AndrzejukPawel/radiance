@@ -132,6 +132,11 @@ public:
               const KVGeom& kvg, const std::vector<RankIO>& ranks);
     void fini();
 
+    /* The bytes init() allocates on each rank's card -- the step slab and, with an encoder, the
+     * media staging -- computed without allocating, for the VRAM budget. -1 when the program is
+     * one init() would refuse. */
+    static int64_t device_bytes(Program& prog, const Config& cfg, const KVGeom& kvg);
+
     /* Build the batch for this step. The returned pointer is stable until the kOut-th next call
      * and is the pointer the rank threads share -- because the ranks share an address space, the
      * batch is shared by pointer rather than broadcast (spec §1). Null on a device failure, which
@@ -365,6 +370,8 @@ private:
     int32_t*               enc_coord_host_ = nullptr;
     int32_t*               enc_cu_host_ = nullptr;
     int64_t                last_n_tok_ = 0;
+    struct MediaBytes { int64_t mm = 0, pix = 0, crd = 0, cu = 0; };
+    MediaBytes media_bytes();   /* the four device regions alloc_media reserves, per rank */
     int  alloc_media();
     void free_media();
     /* The encoder rows of one entry: the media tokens among its positions, their rows copied into
@@ -372,6 +379,10 @@ private:
     int64_t stage_mm_rows(const StepEntry& e, int64_t k, int64_t shift, int64_t n_rows,
                           int32_t* rows);
 
+    /* The members init() derives from the program and the config, allocating nothing. */
+    int  layout(Program& prog, const Config& cfg);
+    /* The set's groups and its carve with no base: dev_bytes and host_bytes, nothing reserved. */
+    void size_set(Set& s, const std::vector<KVGroupInfo>& groups);
     int  alloc_set(Set& s, const std::vector<KVGroupInfo>& groups);
     void free_set(Set& s);
     /* Point every h_* at host staging based at `base`, and every d_* at rank 0's slab. */

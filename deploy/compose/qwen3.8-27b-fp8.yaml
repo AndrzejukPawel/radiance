@@ -8,4 +8,4 @@ services:
     command: >
       --model /models/qwen3.8-27b-fp8.rad
       --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
-      --tp 2 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8
+      --tp 2 --max-num-seqs 32 --max-model-len 200000 --kv-cache-dtype fp8

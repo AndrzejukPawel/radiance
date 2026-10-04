@@ -1955,6 +1955,11 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
             std::vector<common_peg_parser> optional_parsers;
             for (const auto & [param_name, param_schema] : props.items()) {
                 bool is_required = required.find(param_name) != required.end();
+                // RADIANCE: an optional argument no value satisfies is one no call writes, so it
+                // gets no arm (see chat-auto-parser-generator.cpp); required, it is refused by name.
+                if (!is_required && schema_info.unsatisfiable(param_schema)) {
+                    continue;
+                }
                 bool is_string   = schema_info.resolves_to_string(param_schema);
 
                 auto arg = p.tool_arg(

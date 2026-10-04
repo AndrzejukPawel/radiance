@@ -97,6 +97,7 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0008-autoparser-tagged-calls-separate-on-space-and-named-args-in-any-order.patch
                    patches/0009-chat-a-cdata-section-is-punctuation-not-content.patch
                    patches/0011-chat-add_bos-must-come-from-the-inputs.patch
+                   patches/0012-json-schema-a-schema-no-value-satisfies.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -414,3 +415,20 @@ PATCH SERIES
       common_chat_format_example -- assign `inputs.add_bos = tmpls->add_bos` immediately before
       calling apply, which is the redundancy you would expect if apply were meant to read the
       inputs. The fix ORs the two, so those two callers behave exactly as before.
+
+  patches/0012-json-schema-a-schema-no-value-satisfies.patch
+
+      oh-my-pi's `task` tool declares `"model?": "never"` in its batch form, and Arktype exports
+      `never` as `{"not": {}}` -- as TypeBox does Type.Never. 0004 refuses `not` outright, so the
+      tool-call grammar for every request carrying that tool failed to build and the request with
+      it. `not` of the empty schema is not a constraint that has to be complemented: it makes the
+      schema unsatisfiable, the same schema as `false`, and that is exactly representable where it
+      occurs. An object property of that kind is a key the object never carries -- no rule, and
+      its name kept out of an additionalProperties rule -- and a union alternative of that kind is
+      dropped. The tagged-argument builders (chat-auto-parser-generator.cpp, and chat.cpp's
+      `string="true|false"` format), which give every argument an arm of its own and so never see
+      the object, give an optional one of that kind no arm; a model that writes it reaches the
+      undeclared-argument arm of 0010 where the format has one. core/text/chatfmt.cpp, the
+      declared-format grammar, does the same outside this tree. Where a value is required (a required property, the root, an array's items, a union
+      with no alternative left) it is still refused, by name. Every other `not` is refused as 0004
+      refuses it.

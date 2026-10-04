@@ -165,6 +165,9 @@ public:
      * and nothing else (core/mem/vram_budget.cpp). carve() spends the pool it is given. */
     int     plan_groups(const std::vector<KVGroupInfo>& groups, const Config& cfg);
     int64_t ceiling(int64_t ctx) const;
+    /* The part of every ceiling that is not context: recurrent and conv state for max_seqs
+     * sequences, the checkpoint slots and the padding. Set by plan_groups(). */
+    int64_t fixed_bytes() const { return fixed_; }
     int     carve(Pool& kv_pool);
 
     const std::vector<KVGroupPlan>& plans() const { return plans_; }

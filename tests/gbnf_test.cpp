@@ -764,6 +764,92 @@ TEST(gbnf_json_schema_grammars_agree_with_the_oracle) {
     CHECK(t.masks > 1200);
 }
 
+/* A SCHEMA NO VALUE SATISFIES, which vendor/patches/0012 represents rather than refuses. oh-my-pi's
+ * `task` tool declares `"model?": "never"` in its batch form and Arktype exports that as
+ * `{"not": {}}`, the same schema as JSON Schema's `false`. Refused, it failed the tool-call grammar
+ * of every request that carried the tool. Represented, it is a key the object never holds. */
+TEST(gbnf_a_property_no_value_satisfies_is_a_key_never_written) {
+    auto bv = bpe_like(23, 1500);
+    /* A whole value, from a fresh grammar: every byte taken and the parse at an end. */
+    auto whole = [&](const std::string& gbnf, const std::string& text) {
+        std::unique_ptr<GbnfGrammar> g;
+        std::string err;
+        if (GbnfGrammar::create(gbnf, "root", &bv->v, false, {}, {}, &g, &err) < 0) return false;
+        return g->accept_str(text) >= 0 && g->complete();
+    };
+
+    for (const char* never : { "{\"not\":{}}", "false" }) {
+        const std::string schema = std::string("{\"type\":\"object\",\"properties\":{"
+                                               "\"context\":{\"type\":\"string\"},\"model\":") +
+                                   never + "},\"required\":[\"context\"]}";
+        std::string gbnf, err;
+        CHECK_OK(grammar_from_json_schema(schema, "root", &gbnf, &err));
+        CHECK(whole(gbnf, "{\"context\": \"x\"}"));
+        CHECK(!whole(gbnf, "{\"context\": \"x\", \"model\": \"y\"}"));
+        CHECK(!whole(gbnf, "{\"model\": \"y\", \"context\": \"x\"}"));
+    }
+
+    /* additionalProperties must not readmit the key with a value of its own. */
+    {
+        std::string gbnf, err;
+        CHECK_OK(grammar_from_json_schema(
+            R"({"type":"object","properties":{"model":{"not":{}}},"additionalProperties":true})",
+            "root", &gbnf, &err));
+        CHECK(whole(gbnf, "{\"other\": 1}"));
+        CHECK(!whole(gbnf, "{\"model\": 1}"));
+    }
+
+    /* A union alternative of that kind contributes nothing to the union. */
+    {
+        std::string gbnf, err;
+        CHECK_OK(grammar_from_json_schema(R"({"anyOf":[{"type":"string"},{"not":{}}]})", "root",
+                                          &gbnf, &err));
+        CHECK(whole(gbnf, "\"a\""));
+        CHECK(!whole(gbnf, "1"));
+    }
+
+    /* Where a value is required there is nothing to write, and that is refused by name. */
+    for (const char* schema : {
+             R"({"type":"object","properties":{"model":{"not":{}}},"required":["model"]})",
+             R"({"not":{}})",
+             R"({"anyOf":[{"not":{}},false]})" }) {
+        std::string gbnf, err;
+        CHECK(grammar_from_json_schema(schema, "root", &gbnf, &err) < 0);
+        CHECK(!err.empty());
+    }
+
+    /* And the tool as oh-my-pi sends it, through each served template's tool-call grammar. */
+    const char* tools = R"([{"type":"function","function":{"name":"task",
+      "description":"Spawn subagents.","parameters":{"type":"object","properties":{
+       "context":{"type":"string"},"model":{"not":{}},
+       "tasks":{"type":"array","items":{"type":"object","properties":{
+        "name":{"type":"string"},"agent":{"type":"string","default":"task"},
+        "task":{"type":"string"},"solutionSpace":{"type":"string"},
+        "model":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]},
+        "schemaMode":{"enum":["permissive","strict"]},
+        "tools":{"type":"array","items":{"type":"string"}}},
+        "required":["agent","solutionSpace","task"]}}},
+       "required":["context","tasks"]}}}])";
+    const ojson messages = ojson::array({ ojson{ { "role", "user" }, { "content", "hi" } } });
+    /* "auto" is the choice the server serves (it refuses "required"), with parallel calls on --
+     * the server's default -- and off. Under "auto" a template may leave the reply unconstrained
+     * and produce no grammar at all; what must not happen is a refusal. */
+    int built = 0;
+    for (const TemplateCase& tc : kTemplates) {
+        ChatTemplate ct;
+        REQUIRE(ct.load(slurp(fixture(tc.file)), tc.bos, tc.eos) >= 0);
+        for (int par = 0; par < 2; ++par) {
+            ChatOptions opt;
+            opt.tool_choice = "auto";
+            opt.parallel_tool_calls = par != 0;
+            ChatPrompt cp;
+            CHECK(ct.apply(messages, ojson::parse(tools), opt, &cp) >= 0);
+            if (!cp.grammar.empty()) ++built;
+        }
+    }
+    CHECK(built >= 3);
+}
+
 /* The grammars a chat template writes for its own tool-call syntax, from the three templates the
  * engine serves: walked, and replayed over four agent calls wherever the syntax is the one the
  * calls are written in. */

@@ -885,6 +885,37 @@ TEST(a_declared_format_reads_and_constrains_like_the_derived_one) {
     CHECK_EQ(g.text, b->prompt().grammar);
 }
 
+/* oh-my-pi's `task` tool in its batch form: `"model?": "never"`, which Arktype exports as
+ * `{"not": {}}`. A schema no value satisfies needs no arm, and the declared format and the derived
+ * one agree about that as they agree about everything else. Before, both refused the tool and the
+ * request with it. */
+TEST(an_argument_no_value_satisfies_has_no_arm_in_either_grammar) {
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"task",
+      "description":"Spawn subagents.","parameters":{"type":"object","properties":{
+       "context":{"type":"string"},"model":{"not":{}},
+       "tasks":{"type":"array","items":{"type":"object","properties":{
+        "agent":{"type":"string"},"task":{"type":"string"},"solutionSpace":{"type":"string"},
+        "model":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]}},
+        "required":["agent","solutionSpace","task"]}}},
+       "required":["context","tasks"]}}}])");
+    RadChatFormat c = qwen_abi();
+    ChatFormat declared;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(&c, &declared, &why));
+    ChatGrammarRequest gq;
+    gq.tools = &tools;
+    ChatGrammar g;
+    CHECK_OK(chat_format_grammar(declared, gq, &g, &why));
+    CHECK(!g.text.empty());
+    CHECK(g.text.find("task-arg-model") == std::string::npos);
+
+    Bench* b = bench(models()[0], ChatRequest{}, tools);
+    if (!b) return;
+    gq.generation_prompt = b->prompt().generation_prompt;
+    CHECK_OK(chat_format_grammar(declared, gq, &g, &why));
+    CHECK_EQ(g.text, b->prompt().grammar);
+}
+
 /* THE STRUCT GROWS AT ITS END. A plugin built against a header with fewer fields reports a smaller
  * struct_size, and the fields past it read as zero; one built against a larger header has its
  * extra fields ignored. Nothing is read past what the plugin said it has. */

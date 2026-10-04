@@ -447,6 +447,17 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         for (const auto & [param_name, param_schema] : properties.items()) {
             bool is_required = required.find(param_name) != required.end();
 
+            /* RADIANCE: AN OPTIONAL ARGUMENT NO VALUE SATISFIES IS ONE NO CALL WRITES -- an
+             * Arktype "never", exported as `{"not": {}}` (oh-my-pi's `task` tool declares its batch
+             * form's `model` so). It gets no arm: a schema-checked arm for it is a grammar for a
+             * value that does not exist, and the converter refuses to build one. A model that
+             * writes it anyway reaches the undeclared-argument arm below, as any name outside the
+             * schema does, and the tool says what is wrong. Required, it goes through the schema
+             * and is refused there by name. */
+            if (!is_required && schema_info.unsatisfiable(param_schema)) {
+                continue;
+            }
+
             /* RADIANCE: A NON-STRING ARGUMENT THAT IS NOT VALID JSON IS STILL AN ARGUMENT.
              *
              * An array or object parameter is matched by a schema-constrained JSON parser, and

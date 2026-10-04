@@ -77,9 +77,16 @@ prefix-cache tiers:
 | model | flags |
 |---|---|
 | Qwen3.8-Flash-Next | `--tp 2 --tp-wire wht6 --max-num-seqs 8 --max-model-len 200000 --placement expert_tiered --host-pool-mib 12288 --gpu-headroom-mib 96 --expert-vs-cache-ratio 0.82 --kv-cache-dtype fp8 --num-speculative-tokens 3 --max-num-batched-tokens 2048` |
-| Qwen3.8-27B FP8 and bf16, Qwen3.6-35B-A3B | `--tp 2 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8` |
-| MiniCPM5-2B FP8 and bf16 | `--tp 2 --max-num-seqs 8 --max-model-len 131072 --kv-cache-dtype fp8 --gpu-headroom-mib 160 --max-num-batched-tokens 512` |
+| Qwen3.8-27B FP8, Qwen3.6-35B-A3B | `--tp 2 --max-num-seqs 32 --max-model-len 200000 --kv-cache-dtype fp8` |
+| Qwen3.8-27B bf16 | `--tp 2 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8` |
+| MiniCPM5-2B FP8 and bf16 | `--tp 2 --max-num-seqs 32 --max-model-len 131072 --kv-cache-dtype fp8 --gpu-headroom-mib 160 --max-num-batched-tokens 512` |
 | Qwen3.8-Flash-Next bf16 | `--tp 2 --max-model-len 32768 --placement expert_tiered --weights-disk-tier --host-pool-mib 12288 --gpu-headroom-mib 768 --deterministic --max-num-seqs 32 --max-num-batched-tokens 32768 --num-speculative-tokens 0` |
+
+Every model serves up to 32 sequences a step. Two rows keep 8, because on a hybrid model each
+sequence holds its own recurrent state and 32 of them leave the attention cache short of one
+200K-token request: Flash-Next at ratio 0.82 (`--max-num-seqs 32 --expert-vs-cache-ratio 0.78`
+keeps the 200K request and costs single-stream decode about 15%) and the 27B in bf16. See
+[`docs/GUIDE.md`](docs/GUIDE.md) §4.4.
 
 Add `--api-key KEY` to require `Authorization: Bearer KEY`. Add `--debug-graph` to print every op
 and the kernel it resolved to, then exit without serving. Then:

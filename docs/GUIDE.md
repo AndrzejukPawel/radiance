@@ -530,6 +530,27 @@ Every architecture serves both widths, and the flag sets every attention cache o
 a drafter's (DSpark, DFlash2) as well as the trunk's. The delta-net state and the QSA indexer's
 key tail are recurrent state rather than an attention cache and keep their own widths.
 
+**Many sequences against a long context.** `--max-num-seqs` runs to 32 on every model here, and
+what it costs is not context — a sequence holds only the blocks its tokens occupy — but what exists
+per sequence whether it is used or not:
+
+- **Recurrent state.** On a hybrid model every sequence owns its delta-net state, and with
+  speculation two copies of it. Qwen3.8-Flash-Next keeps 54 MiB a copy on each card, so 32
+  sequences take 3.4 GiB of the cache share before a single token is cached. At
+  `--expert-vs-cache-ratio 0.82` the attention cache then holds about 116K tokens, less than one
+  200K request, and startup warns that a longer one would be refused; 0.78 brings it back, and the
+  experts it moves off the card cost single-stream decode about 15%. The 27B in bf16 lands at
+  117K the same way. The 27B in FP8 holds 2.8 full-length sessions at 32, the 35B-A3B ten.
+- **Block tables.** The step batch's tables are carved for every sequence at the full context.
+  They are charged to the VRAM budget (`step staging` in the startup receipt), so they come out of
+  the cache share and not out of `--gpu-headroom-mib`.
+
+The startup line `the pool backs N% of the worst case ... M full-length sessions` counts only the
+part of the pool that holds context, so M is the number to compare with the sessions you expect
+to keep live. With `--tp-wire wht6`, a decode step above the row count startup names is
+all-reduced lossily like a prefill chunk, which a busy step reaches: at 8 sequences and depth 3,
+Flash-Next's decode steps are already over it.
+
 ### 4.5 Prefill speed: the chunk
 
 A long prompt is prefilled in chunks, and `--max-num-batched-tokens` is how big one is. It is the
@@ -786,8 +807,10 @@ radiance --model m.rad --reasoning-effort medium
 | `--host ADDR` | 0.0.0.0 | listen address |
 | `--port N` | 8000 | listen port |
 | `--api-key KEY` | — | require `Authorization: Bearer KEY` on every request but `/health`, `/ping` and the dashboard page (§6.6) |
+| `--served-model-name NAME` | container's name | the model id `/v1/models` lists, the metrics carry and a response names when its request named none. A request may name any model; the one loaded serves it |
 | `--mm-max-patches N` | auto | patches one vision-encoder pass carries, and so the largest image (a patch is 16x16 pixels). `auto` is 16384 when the container carries a vision tower; 0 serves text only and keeps the tower off the card |
 | `--generation-config PATH` | — | sampler defaults from a `generation_config.json` |
+| `--override-chat-template PATH` | container's | a Jinja chat template file served in place of the one the container carries. The reply format (reasoning markers, tool calls) is derived from it too, unless the architecture plugin declares one. An unreadable or empty file stops startup |
 | `--temp F`, `--top-k N`, `--top-p F`, `--min-p F` | from container | sampler defaults |
 | `--reasoning-effort S` | template's own | default `reasoning_effort` for chat |
 
@@ -905,6 +928,11 @@ Calls come back in `message.tool_calls` with `finish_reason: "tool_calls"`. No `
 exactly that, including on raw streamed fragments — content cannot be retracted once sent, so a
 repair applied at the end is not a fix.
 
+A tool's `parameters` schema shapes the grammar the call is written under. A property whose schema
+accepts no value — `false`, or `{"not": {}}`, which is how TypeBox and Arktype export `never` — is
+an argument no call writes. Any other `not` is refused with a 400 naming it: the grammar cannot
+express a complement, and dropping the constraint silently would serve a call the tool forbids.
+
 ### 5.5 Constrained output
 
 ```sh
@@ -974,7 +1002,7 @@ curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
 | `xtc_probability`, `xtc_threshold` | |
 | `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers` | |
 | `seed` | absent means "pick one" — **not** seed 0 |
-| `n` | 1–8. Fan-out over the same prompt; the prefix cache makes it nearly free after the first |
+| `n` | 1 to the larger of 8 and `--max-num-seqs`. Fan-out over the same prompt; the prefix cache makes it nearly free after the first |
 | `priority` | |
 | `stop` | a string or an array |
 | `ignore_eos` | generate to `max_tokens` whatever the model emits |

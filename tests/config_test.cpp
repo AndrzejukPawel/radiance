@@ -198,7 +198,9 @@ TEST(the_paths_and_names_reach_their_fields) {
                      "--placement", "expert_tiered",
                      "--host", "0.0.0.0",
                      "--generation-config", "/g.json",
-                     "--reasoning-effort", "medium" }, &c), RAD_OK);
+                     "--reasoning-effort", "medium",
+                     "--served-model-name", "qwen-coder",
+                     "--override-chat-template", "/t.jinja" }, &c), RAD_OK);
     CHECK_EQ(c.radiance_home, std::string("/rh"));
     CHECK(c.weights_disk_tier);
     CHECK_EQ(c.prefix_cache_dir, std::string("/kvdir"));
@@ -206,6 +208,8 @@ TEST(the_paths_and_names_reach_their_fields) {
     CHECK_EQ(c.host, std::string("0.0.0.0"));
     CHECK_EQ(c.generation_config, std::string("/g.json"));
     CHECK_EQ(c.reasoning_effort, std::string("medium"));
+    CHECK_EQ(c.served_model_name, std::string("qwen-coder"));
+    CHECK_EQ(c.override_chat_template, std::string("/t.jinja"));
 }
 
 TEST(the_boolean_flags_are_off_until_they_are_given) {

@@ -26,6 +26,8 @@ class common_schema_info {
 
     void resolve_refs(nlohmann::ordered_json & schema);
     bool resolves_to_string(const nlohmann::ordered_json & schema);
+    // RADIANCE: whether no value satisfies the schema -- `false`, or `{"not": {}}`.
+    bool unsatisfiable(const nlohmann::ordered_json & schema) const;
 };
 
 struct common_grammar_builder {

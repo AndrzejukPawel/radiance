@@ -968,6 +968,7 @@ and what is left is spent in **two steps**, because only one of the two is a tra
     card total          31.86 GiB   the part's totalGlobalMem
     already held       442.84 MiB   MEASURED once, after every plugin's code object is resident
     activation arena   144.47 MiB   computed from the buffer plan, by the call that allocates it
+    step staging        18.02 MiB   the step batch's block tables and media staging, the same walk
     --gpu-headroom-mib  96.00 MiB   stated
     ------------------------------
     claimable           31.19 GiB
@@ -1018,7 +1019,7 @@ The mover works inside its own slab and cannot evict a KV block to promote an ex
 **What the budget cannot compute, it measures and reports.** `Engine::start` reads the card back
 once everything has allocated and says what settled there against what `--gpu-headroom-mib` asked
 to keep. The engine's own device allocations are ledgered (`rad_dev_alloc_totals`) and are, on a
-served model, exactly the two pools plus the activation arena; the difference between that and the
+served model, exactly the two pools, the activation arena and the step staging; the difference between that and the
 card is the driver's context, its code objects, and any kernel plugin that calls `hipMalloc` for
 itself. That difference is the one thing the headroom exists to cover, and it is printed rather
 than assumed.

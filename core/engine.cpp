@@ -1959,11 +1959,15 @@ int Engine::run_server() {
     }
 
     server::ServerOptions o{};
-    o.model_id = meta_.name && *meta_.name ? meta_.name : "radiance";
+    o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
+               : meta_.name && *meta_.name       ? meta_.name : "radiance";
     o.host     = cfg_.host;
     o.port     = cfg_.port;
     o.api_key  = cfg_.api_key;
     o.max_seqs = cfg_.max_seqs;
+    /* `n` fans one request out over the batch, so a server that runs more sequences a step takes
+     * more choices a request; the floor keeps a small batch from refusing what it would queue. */
+    o.max_n    = (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
     o.max_ctx  = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.default_sampling = resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);

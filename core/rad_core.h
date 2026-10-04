@@ -653,6 +653,10 @@ struct Config {
     /* --api-key: the bearer key every request but the probes and the dashboard page must carry.
      * Empty serves without one. */
     std::string api_key;
+    /* --served-model-name: the id /v1/models lists, a response names when its request named none,
+     * and the metrics carry. Empty takes the container's own name. A request may still name any
+     * model: one model is loaded and every request is served by it. */
+    std::string served_model_name;
 
     /* WHAT A REQUEST THAT SENDS NO SAMPLER SETTINGS IS SERVED WITH.
      *
@@ -671,6 +675,11 @@ struct Config {
     float   sample_min_p = -1.0f;
     /* An operator-supplied generation_config.json, overriding the search described above. */
     std::string generation_config;
+    /* --override-chat-template: a Jinja file whose text replaces the chat template the container
+     * (or the checkpoint directory) carries. Everything that reads the template reads this one:
+     * the chat endpoint's rendering, and the reply format derived from it -- reasoning markers and
+     * tool calls. Empty serves the container's. */
+    std::string override_chat_template;
 
     bool    debug_graph = false;
     bool    debug_selection = false;
