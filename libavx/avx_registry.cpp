@@ -725,14 +725,16 @@ SIMPLE("avx_all_gather", "all_gather", "ar", "gather every rank's shard; world_s
 SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT, L(embed_lookup)),
 /* THE ONE ROW WITH A LAYOUT HOOK, and it only checks: the table is read as it is stored, and the
  * hook refuses a table encoded any other way (avx_ngram.cpp). An E4M3 table into bf16 goes through
- * the row cache; every other dtype pair takes the general gather. */
+ * the row cache; every other dtype pair takes the general gather. Its init refuses a process that
+ * may not make the io_uring ring the cache's misses are read through, at declare and not at the
+ * first request. */
 { "avx_embed_lookup_q", "embed_lookup_q", "vocab",
   "embedding gather, one scale for the table: an E4M3 table into bf16 through a shared row cache "
   "and direct reads of the container, a later call's rows read ahead",
   SHAPE_ANY, DT_ANY, RAD_DOMAIN_HOST, 0,
   nullptr, 0, nullptr, 0, nullptr,
-  /* init, fini, LAUNCH, scratch, layout, relayout, opd_shape, unrelayout */
-  nullptr, nullptr, L(embed_lookup_q), nullptr, avx_layout_ngram, nullptr, nullptr, nullptr,
+  /* INIT, fini, LAUNCH, scratch, layout, relayout, opd_shape, unrelayout */
+  avx_init_ngram, nullptr, L(embed_lookup_q), nullptr, avx_layout_ngram, nullptr, nullptr, nullptr,
   nullptr, nullptr },
 SIMPLE("avx_logits_gemm", "logits_gemm", "vocab", "the lm_head projection", DT_FLOAT,
        L(logits_gemm)),

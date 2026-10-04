@@ -226,6 +226,10 @@ struct FakeMultimodal : IMultimodal {
 struct FakeScheduler : IScheduler {
     std::string reply = "hello";
     bool hang = false;
+    /* Nonzero: after the reply, the request is failed with this status and reason, as the engine
+     * fails every request it holds when a step fails. */
+    int fail_status = 0;
+    const char* fail_why = nullptr;
     SchedMetrics m;
 
     std::mutex mu;
@@ -251,9 +255,11 @@ struct FakeScheduler : IScheduler {
         int32_t cap = r.max_tokens;
         std::string text = reply;
         bool h = hang;
+        const int fst = fail_status;
+        const char* fwhy = fail_why;
         /* Under the lock: over a real socket, submits arrive from several HTTP workers at once. */
         std::lock_guard<std::mutex> lk(mu);
-        workers.emplace_back([sink, cap, text, h] {
+        workers.emplace_back([sink, cap, text, h, fst, fwhy] {
             sink_prompt_stats(sink, 8, 4);
             int32_t n = 0;
             for (char c : text) {
@@ -271,6 +277,7 @@ struct FakeScheduler : IScheduler {
                 sink_finish(sink, Finish::Length);
                 return;
             }
+            if (fst) { sink_fail(sink, fst, fwhy); return; }
             sink_finish(sink, n >= cap ? Finish::Length : Finish::Stop);
         });
         return id;
@@ -1055,6 +1062,17 @@ TEST(the_max_tokens_default_and_cap_bound_a_request_like_the_context) {
     CHECK_EQ(chat_with(f, lim, R"("max_tokens":9999)").max_tokens, 10);
     CHECK_EQ(chat_with(f, lim, R"("max_tokens":5)").max_tokens, 5);
 
+    /* AND `auto` IS THE DEFAULT: limits built with nothing said about max_tokens give a request
+     * that names none what the context leaves. 512 ended a reasoning model's answers inside its
+     * reasoning, with a finish_reason "length" a chat client does not show. */
+    {
+        OaiLimits d;
+        d.model_id = lim.model_id;
+        d.max_ctx = 64;
+        OaiRequest a = chat_with(f, d, "");
+        CHECK_EQ((int64_t)a.prompts[0].tokens.size() + a.max_tokens, d.max_ctx);
+    }
+
     /* The cap holds where no context is declared, and on /v1/completions. */
     lim.max_ctx = 0;
     lim.default_max_tokens = 512;
@@ -1239,7 +1257,7 @@ TEST(server_info_reports_what_a_request_that_leaves_a_field_out_gets) {
         ServerOptions o;
         Server srv(d, o);
         const json j = json::parse(srv.router().call("GET", "/server_info").body);
-        CHECK_EQ(j["server"]["default_max_tokens"].get<int64_t>(), 512);
+        CHECK(j["server"]["default_max_tokens"].is_null());        /* auto */
         CHECK(j["server"]["max_tokens_cap"].is_null());
         CHECK_EQ(j["server"]["max_stop_strings"].get<int64_t>(), 64);
         const json& r = j["request_defaults"];
@@ -1440,6 +1458,43 @@ TEST(streaming_completions_use_the_text_completion_chunk_shape) {
         text += j["choices"][0]["text"].get<std::string>();
     }
     CHECK_EQ(text, std::string("pq"));
+}
+
+/* A REQUEST THE ENGINE FAILED SAYS WHAT FAILED, in the 500 and in a stream's error event: the
+ * reason and the status the engine stopped on. It read "the engine failed this request: ok" when
+ * a step failed, because nothing carried the status to the request. */
+TEST(a_request_the_engine_failed_says_what_failed) {
+    Fixture f;
+    f.sched.reply = "he";
+    f.sched.fail_status = RAD_E_UNSUPPORTED;
+    f.sched.fail_why = "the engine stopped on an error and is not serving";
+    const std::string want = "the engine failed this request: the engine stopped on an error and "
+                             "is not serving (unsupported)";
+
+    HttpResponse r = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(r.status, 500);
+    CHECK_EQ(json::parse(r.body)["error"]["message"].get<std::string>(), want);
+
+    HttpResponse s = f.post("/v1/completions", R"({"prompt":"hi","stream":true})");
+    CHECK_EQ(s.status, 200);
+    int bad = 0, errors = 0;
+    for (const std::string& p : sse_payloads(drain(s), &bad)) {
+        if (p == "[DONE]") continue;
+        json j = json::parse(p);
+        if (!j.contains("error")) continue;
+        ++errors;
+        CHECK_EQ(j["error"]["message"].get<std::string>(), want);
+    }
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(errors, 1);
+
+    /* With no reason given, the status alone -- and never "ok". */
+    f.sched.fail_why = nullptr;
+    HttpResponse t = f.post("/v1/chat/completions",
+                            R"({"messages":[{"role":"user","content":"hi"}]})");
+    CHECK_EQ(json::parse(t.body)["error"]["message"].get<std::string>(),
+             std::string("the engine failed this request: unsupported"));
 }
 
 TEST(a_streamed_tool_call_is_named_before_its_arguments_flow) {

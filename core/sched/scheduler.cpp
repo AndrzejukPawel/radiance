@@ -98,6 +98,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     ctx_limit_ = builder_.max_ctx();
     n_deferred_ = 0;
     closed_ = false;
+    closed_status_ = RAD_E_STATE;
 
     /* Everything the step path touches is reserved here. A vector that grows during a step is an
      * allocator call on the path this whole component exists to keep clear. */
@@ -152,7 +153,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
      * listening to -- and the refusal says why. */
     if (closed_) {
         RAD_WARN("request %llu refused: %s", (unsigned long long)r->id, closed_reason_);
-        server::sink_fail(r->sink, RAD_E_STATE);
+        server::sink_fail(r->sink, closed_status_, closed_reason_);
         return RAD_E_STATE;
     }
 
@@ -312,7 +313,7 @@ void Scheduler::trim_prefix_cache() {
 }
 
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
-                              bool publish) {
+                              bool publish, int status, const char* why) {
     /* PUBLISH BEFORE FREEING. This is the only moment the sequence's whole prefix is both
      * computed and still owned, and it is what makes the cache a cache rather than a permanently
      * empty lookup: insert() takes its own KV references, so the blocks survive the free below.
@@ -359,7 +360,8 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     /* Terminal, and idempotent on the sink's side: the first call wins, so a cancel racing a
      * natural stop does not produce two finish reasons. This is the last thing the producer does
      * to the sink, and the HTTP thread is waiting on exactly it. */
-    server::sink_finish(s.req->sink, finish_of(st, s.req->finish_reason));
+    if (st == ReqState::Failed && status < 0) server::sink_fail(s.req->sink, status, why);
+    else server::sink_finish(s.req->sink, finish_of(st, s.req->finish_reason));
 }
 
 int Scheduler::cancel(uint64_t id) {
@@ -467,10 +469,11 @@ void Scheduler::release_deferred() {
     sweep_deferred();
 }
 
-void Scheduler::shutdown(const char* reason) {
+void Scheduler::shutdown(const char* reason, int status) {
     std::lock_guard<std::mutex> lk(mu_);
     closed_ = true;
     closed_reason_ = reason ? reason : "the engine has stopped";
+    closed_status_ = status < 0 ? status : RAD_E_STATE;
     /* Copied first: close_request erases from both queues. */
     std::vector<int32_t> live(running_);
     live.insert(live.end(), waiting_.begin(), waiting_.end());
@@ -478,7 +481,7 @@ void Scheduler::shutdown(const char* reason) {
         SchedReq& s = *reqs_[(size_t)slot];
         if (!s.req) continue;
         close_request(s, ReqState::Failed, closed_reason_, /*defer_free=*/false,
-                      /*publish=*/false);
+                      /*publish=*/false, closed_status_, closed_reason_);
         ++m_.failed;
         completed_.push_back(s.req->id);
     }
@@ -944,7 +947,8 @@ const RadBatch* Scheduler::step() {
                          kv_->can_ever_fit(r.n_computed + want)
                              ? " and nothing lower-priority is left to preempt"
                              : " at any occupancy");
-                close_request(s, ReqState::Failed, "kv_exhausted");
+                close_request(s, ReqState::Failed, "kv_exhausted", false, true, RAD_E_FULL,
+                              "the KV pool cannot hold it");
                 ++m_.failed;
                 completed_.push_back(r.id);
                 failed = true;
@@ -1035,7 +1039,8 @@ const RadBatch* Scheduler::step() {
                 RAD_WARN("request %llu failed: %lld tokens leave no room in a %lld-token context",
                          (unsigned long long)s.req->id, (long long)s.seq_len(),
                          (long long)ctx_limit_);
-                close_request(s, ReqState::Failed, "context_length_exceeded");
+                close_request(s, ReqState::Failed, "context_length_exceeded", false, true,
+                              RAD_E_FULL, "it leaves no room in the context");
                 ++m_.failed;
                 completed_.push_back(s.req->id);
                 continue;

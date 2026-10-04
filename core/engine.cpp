@@ -383,7 +383,7 @@ void Engine::phase_mark(int p) {
 int Engine::fail_loop(int st) {
     stopping_.store(true, std::memory_order_release);
     if (barrier_) barrier_->abort();
-    sched_.shutdown("the engine stopped on an error and is not serving");
+    sched_.shutdown("the engine stopped on an error and is not serving", st < 0 ? st : RAD_E_STATE);
     loop_status_.store(st < 0 ? st : RAD_E_STATE, std::memory_order_release);
     return st;
 }
@@ -2027,12 +2027,13 @@ int Engine::run_server() {
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.default_sampling = resolve_sampling_defaults(meta_, file_ != nullptr, cfg_);
     o.default_dry_breakers_set = cfg_.sample_dry_seq_breakers.has_value();
-    /* -1 leaves ServerOptions' own default. `auto` (0) is resolved per request against the
-     * context, so it needs one to resolve against. */
+    /* -1 leaves ServerOptions' own default, which is `auto` (0). That is resolved per request
+     * against the context, so it needs one to resolve against. */
     if (cfg_.default_max_tokens >= 0) o.default_max_tokens = cfg_.default_max_tokens;
     if (o.default_max_tokens == 0 && o.max_ctx <= 0) {
-        RAD_ERR("--default-max-tokens auto is what the context leaves, and this model states no "
-                "context; pass --max-model-len");
+        RAD_ERR("a request that names no max_tokens gets what the context leaves after its prompt "
+                "(--default-max-tokens auto), and this model states no context; pass "
+                "--max-model-len, or --default-max-tokens N");
         return RAD_E_INVAL;
     }
     o.max_tokens_cap  = cfg_.max_tokens_cap;

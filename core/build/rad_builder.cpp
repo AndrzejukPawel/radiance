@@ -1498,7 +1498,7 @@ int Builder::finish() {
                     w.source.c_str(), rad_dtype_name(w.decl.dtype));
         }
 
-    finish_instances();
+    if (instances_) finish_instances();
     finish_weight_uses();
     finish_layouts();
     finish_kv_groups();

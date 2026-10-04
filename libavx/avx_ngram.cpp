@@ -439,6 +439,7 @@ struct ReadRing {
     io_uring_cqe  *cqes     = nullptr;
     void          *sq_ring  = nullptr, *cq_ring = nullptr;
     size_t         sq_sz = 0, cq_sz = 0, sqe_sz = 0;
+    int            err      = 0;     /* the errno that stopped init(), for ring_refusal() */
 
     /* One thread submits and reaps (SINGLE_ISSUER), and completions are run when it asks for them
      * rather than by interrupting it (DEFER_TASKRUN): the ring is thread-local and the thread only
@@ -448,7 +449,7 @@ struct ReadRing {
         std::memset(&p, 0, sizeof p);
         p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
         const long r = syscall(__NR_io_uring_setup, kEntries, &p);
-        if (r < 0) return false;
+        if (r < 0) { err = errno; return false; }
         fd      = (int)r;
         entries = p.sq_entries;
         sq_sz   = p.sq_off.array + (size_t)p.sq_entries * sizeof(unsigned);
@@ -459,16 +460,16 @@ struct ReadRing {
         }
         sq_ring = mmap(nullptr, sq_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                        fd, IORING_OFF_SQ_RING);
-        if (sq_ring == MAP_FAILED) { sq_ring = nullptr; shut(); return false; }
+        if (sq_ring == MAP_FAILED) { err = errno; sq_ring = nullptr; shut(); return false; }
         cq_ring = (p.features & IORING_FEAT_SINGLE_MMAP)
                 ? sq_ring
                 : mmap(nullptr, cq_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
                        fd, IORING_OFF_CQ_RING);
-        if (cq_ring == MAP_FAILED) { cq_ring = nullptr; shut(); return false; }
+        if (cq_ring == MAP_FAILED) { err = errno; cq_ring = nullptr; shut(); return false; }
         sqe_sz = (size_t)p.sq_entries * sizeof(io_uring_sqe);
         sqes   = (io_uring_sqe*)mmap(nullptr, sqe_sz, PROT_READ | PROT_WRITE,
                                      MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
-        if (sqes == MAP_FAILED) { sqes = nullptr; shut(); return false; }
+        if (sqes == MAP_FAILED) { err = errno; sqes = nullptr; shut(); return false; }
         sq_tail  = (unsigned*)((char*)sq_ring + p.sq_off.tail);
         sq_mask  = (unsigned*)((char*)sq_ring + p.sq_off.ring_mask);
         sq_array = (unsigned*)((char*)sq_ring + p.sq_off.array);
@@ -532,15 +533,49 @@ struct ReadRing {
 
 /* Thread-local: each rank thread issues its own step, so each gets its own ring and the two never
  * contend. Built on that thread's first gather over a file and torn down when the thread exits. */
-inline ReadRing* read_ring() {
+/* This thread's ring, made on its first gather. Null if it could not be made, with the errno in
+ * `*why`. */
+inline ReadRing* read_ring(int* why) {
     static thread_local bool tried = false;
+    static thread_local int  err   = 0;
     static thread_local std::unique_ptr<ReadRing> r;
     if (!tried) {
         tried = true;
         std::unique_ptr<ReadRing> p(new ReadRing());
         if (p->init()) r = std::move(p);
+        else           err = p->err ? p->err : EIO;
     }
+    if (!r && why) *why = err;
     return r.get();
+}
+
+/* WHY THIS PROCESS CANNOT MAKE A RING, said in terms of what to change. Docker's default seccomp
+ * profile is by far the commonest: it answers EPERM to io_uring_setup, and so does the
+ * kernel.io_uring_disabled sysctl. A kernel too old for SINGLE_ISSUER and DEFER_TASKRUN answers
+ * EINVAL. */
+std::string ring_refusal(int e) {
+    std::string s = "libavx: the n-gram table is read through io_uring, and this process cannot "
+                    "make a ring (" + std::string(std::strerror(e)) + "). ";
+    if (e == EPERM || e == EACCES)
+        s += "Docker's default seccomp profile refuses io_uring: run the container with "
+             "--security-opt seccomp=unconfined (docs/DOCKER.md). Outside a container, the "
+             "kernel.io_uring_disabled sysctl refuses it the same way.";
+    else if (e == ENOSYS)
+        s += "This kernel is built without io_uring.";
+    else if (e == EINVAL)
+        s += "The ring needs IORING_SETUP_SINGLE_ISSUER and IORING_SETUP_DEFER_TASKRUN, which "
+             "Linux 6.1 added.";
+    return s;
+}
+
+/* Whether this process can make the ring every gathering thread makes: 0, or the errno that
+ * stopped it. Asked once, by making one and closing it. */
+int ring_errno() {
+    static const int e = [] {
+        ReadRing r;
+        return r.init() ? 0 : (r.err ? r.err : EIO);
+    }();
+    return e;
 }
 
 /* Read `reads` through the ring, a batch at a time: a row with a slot is copied into the cache and
@@ -711,7 +746,7 @@ struct AheadReader {
 
     void run() {
         Gather&        g  = gather_state();
-        ReadRing*      rr = read_ring();
+        ReadRing*      rr = read_ring(nullptr);
         const uint64_t me = owner_tag();
         for (;;) {
             AheadJob j;
@@ -861,9 +896,15 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
     if (!tfile) return ferr;
 #if defined(__linux__)
     if (tfile->fd >= 0) {
-        ReadRing* rr = read_ring();
+        int why = 0;
+        ReadRing* rr = read_ring(&why);
+        if (!rr) {
+            static std::once_flag said;
+            std::call_once(said, [why] { std::fprintf(stderr, "%s\n", ring_refusal(why).c_str()); });
+            return RAD_E_UNSUPPORTED;
+        }
         RowCache* rc = row_cache(tfile, q.row_bytes);
-        if (!rr || !rc) return RAD_E_UNSUPPORTED;
+        if (!rc) return RAD_E_NOMEM;
         const long long ws    = q.world_size > 1 ? q.world_size : 1;
         const long long first = q.rank > 0 && q.rank < ws ? q.M * q.rank / ws : 0;
         const int rs = gather_rows(*tfile, *rc, *rr, q, first, decode, lut);
@@ -942,4 +983,31 @@ extern "C" int avx_layout_ngram(const RadParam* p, int n_p, int operand, const R
     const long long r = operand == EQ_WTE ? rows : 1, c = operand == EQ_WTE ? dim : 1;
     if (pl[0].rank != 2 || pl[0].shape[0] != r || pl[0].shape[1] != c) return RAD_E_SHAPE;
     return RAD_E_UNSUPPORTED;
+}
+
+/* ============================== THE INSTANCE: CAN THIS PROCESS READ THE TABLE ==============================
+ *
+ * Every miss of the gather into bf16 is an io_uring read, and a process that may not make a ring
+ * fails every step that gathers: the first request fails, after the whole model has loaded, and
+ * the engine stops. So the instance asks at declare, before a byte is loaded, and refuses with
+ * the reason. A gather into any other dtype takes the general path, which reads the table as
+ * memory and makes no ring. rad-convert declares without instances -- it launches nothing -- so a
+ * sandbox that forbids io_uring still converts the model. */
+extern "C" int avx_init_ngram(const RadParam* p, int n_p, int rank, int world_size, void** out) {
+    (void)rank;
+    (void)world_size;
+    if (out) *out = nullptr;
+#if defined(__linux__)
+    const char* dt = rad_param_gets(p, n_p, "dtype", nullptr);
+    if (!dt || std::strcmp(dt, "bf16") != 0) return RAD_OK;
+    if (const int e = ring_errno()) {
+        static std::once_flag said;
+        std::call_once(said, [e] { std::fprintf(stderr, "%s\n", ring_refusal(e).c_str()); });
+        return RAD_E_UNSUPPORTED;
+    }
+#else
+    (void)p;
+    (void)n_p;
+#endif
+    return RAD_OK;
 }

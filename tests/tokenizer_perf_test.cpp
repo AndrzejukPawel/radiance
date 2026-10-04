@@ -7,8 +7,8 @@
  *   - throughput on prose-and-code text, against an absolute floor and against the reference
  *     encoder (tools/tokref) on the same text -- the ratio holds on a loaded machine where an
  *     absolute number would not;
- *   - LINEAR SCALING: twice the text takes about twice the time, on ordinary text and on the
- *     inputs a pre-tokeniser is quadratic on when it goes wrong (one enormous word, one
+ *   - LINEAR SCALING: four times the text takes about four times the time, on ordinary text and
+ *     on the inputs a pre-tokeniser is quadratic on when it goes wrong (one enormous word, one
  *     enormous run of whitespace, digits, alternating classes);
  *   - the segment cache: the last turn of a long conversation costs a fraction of encoding it.
  *
@@ -82,6 +82,18 @@ double encode_seconds(const Tokenizer& t, const std::string& text, int runs = 5)
     return best_of(runs, [&] { ids.clear(); t.encode(text, ids, false, true); });
 }
 
+/* TWO TEXTS TIMED IN TURNS, best of five each, so a burst of load from whatever else the machine
+ * runs lands on both: timed one after the other, a parallel ctest beside a server read a linear
+ * input as x3.6 for twice the text, past the bound a quadratic one is held to. */
+void encode_both(const Tokenizer& t, const std::string& small, const std::string& big,
+                 double* ts, double* tb) {
+    *ts = *tb = 1e30;
+    for (int i = 0; i < 5; ++i) {
+        *ts = std::min(*ts, encode_seconds(t, small, 1));
+        *tb = std::min(*tb, encode_seconds(t, big, 1));
+    }
+}
+
 }  /* namespace */
 
 TEST(throughput_has_a_floor_and_beats_the_reference) {
@@ -100,20 +112,23 @@ TEST(throughput_has_a_floor_and_beats_the_reference) {
     CHECK(r / s > 4.0);
 }
 
-/* TWICE THE TEXT, ABOUT TWICE THE TIME. The texts differ, so a cache that remembered one would
- * not help the other; the ratio is allowed well past 2 because the larger one also walks more of
- * memory. */
+/* FOUR TIMES THE TEXT, ABOUT FOUR TIMES THE TIME. The texts differ, so a cache that remembered one
+ * would not help the other; the ratio is allowed well past 4 because the larger one also walks
+ * more of memory. A quarter and a whole megabyte: the cost of a byte steps up by about half
+ * between one and two megabytes on the machine these were measured on, where the working set
+ * leaves the core's cache, and a step across that reads as growth the encoder does not have. */
 TEST(encoding_time_is_linear_in_the_text) {
     auto v = vocab();
     REQUIRE(v != nullptr);
     Tokenizer t;
     t.init(v);
     t.set_segment_cache(false);
-    const std::string one = document(3, 1 << 20), two = document(4, 2 << 20);
-    const double a = encode_seconds(t, one), b = encode_seconds(t, two);
-    std::fprintf(stderr, "    1 MB %.2f ms, 2 MB %.2f ms, ratio %.2f\n", a * 1e3, b * 1e3, b / a);
-    CHECK(b / a > 1.3);
-    CHECK(b / a < 2.8);
+    const std::string one = document(3, 256 << 10), four = document(4, 1 << 20);
+    double a, b;
+    encode_both(t, one, four, &a, &b);
+    std::fprintf(stderr, "    256 KB %.2f ms, 1 MB %.2f ms, ratio %.2f\n", a * 1e3, b * 1e3, b / a);
+    CHECK(b / a > 2.6);
+    CHECK(b / a < 6.0);
 }
 
 /* THE INPUTS A SPLITTER GOES QUADRATIC ON. A backtracking `\s+(?!\S)` rescans a whitespace run
@@ -133,14 +148,16 @@ TEST(pathological_inputs_stay_linear) {
         { "alternating", [](size_t n) { std::string s; while (s.size() < n) s += "a1!"; return s; } },
         { "apostrophes", [](size_t n) { std::string s; while (s.size() < n) s += "''s"; return s; } },
     };
-    /* A megabyte and two, best of five: at a few hundred kilobytes one of these runs in a couple of
-     * milliseconds, which one preemption under a parallel ctest turns into a false quadratic. */
+    /* 125 and 500 KB: linear is 4, quadratic 16, and the bound of 8 sits a factor of two from
+     * each. Both stay below the size where a byte's cost steps up (see above); a run of whitespace
+     * costs a little more a byte as it grows, about x4.8 here, and that is not what this holds. */
     for (const auto& in : inputs) {
-        const std::string one = in.make(1000000), two = in.make(2000000);
-        const double a = encode_seconds(t, one, 5), b = encode_seconds(t, two, 5);
-        std::fprintf(stderr, "    %-17s 1 MB %7.2f ms, 2 MB %7.2f ms, ratio %.2f\n", in.name,
+        const std::string one = in.make(125000), four = in.make(500000);
+        double a, b;
+        encode_both(t, one, four, &a, &b);
+        std::fprintf(stderr, "    %-17s 125 KB %7.2f ms, 500 KB %7.2f ms, ratio %.2f\n", in.name,
                      a * 1e3, b * 1e3, b / a);
-        CHECK(b / a < 3.0);
+        CHECK(b / a < 8.0);
     }
 }
 

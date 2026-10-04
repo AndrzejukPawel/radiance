@@ -66,7 +66,7 @@ struct ServerOptions {
     int         retry_after_s = 1;
 
     int64_t     max_ctx = 0;
-    int64_t     default_max_tokens = 512;   /* 0: what the context leaves (OaiLimits) */
+    int64_t     default_max_tokens = 0;     /* 0: what the context leaves (OaiLimits) */
     int64_t     max_tokens_cap = 0;         /* 0: none */
     int         max_n = 8;
     int64_t     max_stops = 64;

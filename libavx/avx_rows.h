@@ -52,4 +52,8 @@ int row_gather(const RowGather& g, RowDecode decode);
 extern "C" int avx_layout_ngram(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
 
+/* Whether this process can read the table's rows: refused, with the reason on stderr, where it may
+ * not make an io_uring ring (avx_ngram.cpp). */
+extern "C" int avx_init_ngram(const RadParam*, int, int, int, void**);
+
 #endif /* RAD_AVX_ROWS_H */

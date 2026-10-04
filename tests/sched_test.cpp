@@ -10,6 +10,7 @@
 
 #include "sched/scheduler.h"
 #include "sched/derive.h"
+#include "server/sink.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -539,6 +540,19 @@ struct Fixture {
         r->priority = priority;
         r->ignore_eos = ignore_eos;
         r->max_tokens = max_tokens;
+        r->prompt.resize((size_t)n_prompt);
+        for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = 1000 + i;
+        uint64_t id = r->id;
+        if (sch.add(std::move(r)) < 0) return 0;
+        return id;
+    }
+
+    /* The same, with the server's sink attached, for what a request tells its client. */
+    uint64_t submit_to(server::Sink* sink, int n_prompt, int max_tokens) {
+        auto r = std::make_unique<Request>();
+        r->id = next_id++;
+        r->max_tokens = max_tokens;
+        r->sink = sink;
         r->prompt.resize((size_t)n_prompt);
         for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = 1000 + i;
         uint64_t id = r->id;
@@ -2037,6 +2051,29 @@ TEST(shutdown_fails_what_is_queued_and_refuses_what_follows) {
     CHECK_EQ(f.kv.free_blocks(0), before);
     CHECK(f.submit(8, 8) == 0);
     CHECK(f.sch.step() == nullptr);
+}
+
+/* AND EACH OF THOSE REQUESTS SAYS WHAT STOPPED IT. The sink carries the status and the sentence
+ * the server puts in the 500: without them a client read "the engine failed this request: ok"
+ * after a step failed as unsupported. */
+TEST(shutdown_fails_each_sink_with_the_status_that_stopped_the_engine) {
+    server::Sink running, waiting, late;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+
+    CHECK(f.submit_to(&running, 160, 64) != 0);
+    CHECK(f.sch.step() != nullptr);
+    CHECK(f.submit_to(&waiting, 160, 64) != 0);
+
+    f.sch.shutdown("the engine stopped", RAD_E_UNSUPPORTED);
+    CHECK(f.submit_to(&late, 8, 8) == 0);
+    for (server::Sink* s : { &running, &waiting, &late }) {
+        CHECK(s->done());
+        CHECK_EQ((int)s->finish_reason(), (int)server::Finish::Error);
+        CHECK_EQ(s->status(), (int)RAD_E_UNSUPPORTED);
+        CHECK_EQ(std::string(s->why() ? s->why() : ""), std::string("the engine stopped"));
+    }
 }
 
 RAD_TEST_MAIN()

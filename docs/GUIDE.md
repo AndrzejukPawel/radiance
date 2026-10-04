@@ -739,8 +739,11 @@ radiance --model m.rad --presence-penalty 1.5 --repetition-penalty 1.05
 
 **How much a request may generate.**
 
-- `--default-max-tokens N` sets `max_tokens` for a request that sends none. The default is 512.
-  `auto` means whatever the context leaves after the prompt.
+- `--default-max-tokens N` sets `max_tokens` for a request that sends none. The default, `auto`,
+  is whatever the context leaves after the prompt, as in vLLM. Many clients send no `max_tokens`,
+  and a reasoning model can think for thousands of tokens before it answers: a small default ends
+  those answers inside the reasoning, with a `finish_reason: "length"` that chat clients do not
+  show.
 - `--max-tokens-cap N` is the most any request may generate. A larger `max_tokens` is cut to it
   rather than refused, and the reply ends with `finish_reason: "length"`, the same as the context
   bound (§5.8).
@@ -887,7 +890,7 @@ that names the field wins.
 | `--dry-multiplier F`, `--dry-base F`, `--dry-allowed-length N`, `--dry-penalty-last-n N` | 0, 1.75, 2, -1 | DRY; a multiplier of 0 is off |
 | `--dry-sequence-breakers JSON` | `["\n", ":", "\"", "*"]` | a JSON array of at most 16 strings |
 | `--xtc-probability F`, `--xtc-threshold F` | 0, 0.1 | [0, 1] |
-| `--default-max-tokens N` | 512 | `max_tokens` for a request that sends none; `auto` is what the context leaves |
+| `--default-max-tokens N` | `auto` | `max_tokens` for a request that sends none; `auto` is what the context leaves |
 | `--max-tokens-cap N` | none | the most any request may generate; a larger `max_tokens` is cut to it, not refused |
 | `--max-n N` | the larger of 8 and `--max-num-seqs` | the largest `n` a request may ask for |
 | `--max-stop-strings N`, `--max-stop-bytes N` | 64, 4096 | how many stop strings a request may send, and how long each may be |
@@ -1092,7 +1095,7 @@ curl -s http://localhost:8000/detokenize -H 'Content-Type: application/json' \
 |---|---|
 | `model` | accepted and not enforced — one server serves one model |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
-| `max_tokens`, `max_completion_tokens` | default 512 (`--default-max-tokens`). Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused — see §5.8 |
+| `max_tokens`, `max_completion_tokens` | default: what the context leaves after the prompt (`--default-max-tokens`). Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused — see §5.8 |
 | `temperature` | [0, 2] |
 | `top_p` | (0, 1] |
 | `top_k` | ≥ 0, 0 disables |

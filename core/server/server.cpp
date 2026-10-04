@@ -412,6 +412,16 @@ bool Server::pump(std::vector<Generation>& gens, const OaiRequest& r) {
 
 /* ------------------------------------------------------------------ metrics bookkeeping */
 
+/* WHAT FAILED, for the client: the sentence the failing component gave, and the status. A failed
+ * request always carries a status -- an engine that stopped carries the one that stopped it -- so
+ * this never reads "ok". */
+static std::string engine_failure(const Sink& s) {
+    const int st = s.status() < 0 ? s.status() : RAD_E_STATE;
+    const char* why = s.why();
+    return why ? fmt("the engine failed this request: %s (%s)", why, rad_strerror(st))
+               : fmt("the engine failed this request: %s", rad_strerror(st));
+}
+
 static SuccessReason to_reason(Finish f) {
     switch (f) {
         case Finish::Length:    return SuccessReason::Length;
@@ -536,14 +546,14 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     /* An engine-side failure is not a 200 with an empty answer. */
     for (auto& g : gens) {
         if (g.finish == Finish::Error) {
-            int st = g.sink->status();
+            const std::string why = engine_failure(*g.sink);
             retire(gens);
             release(r.n_choices());
             record(r, gens, Finish::Error);
             ApiError e;
             e.status = 500;
             e.type = "internal_server_error";
-            e.message = std::string("the engine failed this request: ") + rad_strerror(st);
+            e.message = why;
             return error_response(e);
         }
     }
@@ -689,8 +699,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                     ApiError e;
                     e.status = 500;
                     e.type = "internal_server_error";
-                    e.message = std::string("the engine failed this request: ") +
-                                rad_strerror(g.sink->status());
+                    e.message = engine_failure(*g.sink);
                     out += sse_error(e);
                 }
             }

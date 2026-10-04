@@ -28,12 +28,103 @@
 #include <cstring>
 #include <thread>
 
+#include <cstddef>
+
 #include <fcntl.h>
+#include <linux/filter.h>
 #include <linux/io_uring.h>
+#include <linux/seccomp.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+/* EMBED_LOOKUP_Q'S INIT REFUSES A PROCESS THAT MAY NOT MAKE AN io_uring RING, and says why: Docker's
+ * default seccomp profile answers EPERM to io_uring_setup, and a server started that way used to
+ * load the whole model and then fail every request as "unsupported". A child process installs the
+ * same refusal as a seccomp filter and asks the kernel's init, which must refuse a gather into
+ * bf16 -- the one that reads through the ring -- name the Docker option on stderr, and accept a
+ * gather into f32, which reads the table as memory. Then this process asks: it must accept where a
+ * ring can be made and refuse where it cannot, as in a build sandbox. */
+bool ngram_init_case(const Lib& avx) {
+    const char* what = "embed_lookup_q's init";
+    const RadKernelInfo* r = avx.row("embed_lookup_q");
+    if (!r || !r->init) {
+        std::printf("  %s: the row has no init\n", what);
+        return false;
+    }
+    RadParam bf16[2]{}, f32[2]{};
+    bf16[0].key = f32[0].key = "n_embd";
+    bf16[0].kind = f32[0].kind = RAD_P_INT;
+    bf16[0].ival = f32[0].ival = 160;
+    bf16[1].key = f32[1].key = "dtype";
+    bf16[1].kind = f32[1].kind = RAD_P_STR;
+    bf16[1].sval = "bf16";
+    f32[1].sval = "f32";
+
+    int out[2];
+    if (::pipe(out) != 0) {
+        std::printf("  %s: pipe: %s\n", what, std::strerror(errno));
+        return false;
+    }
+    std::fflush(nullptr);
+    const pid_t pid = ::fork();
+    if (pid == 0) {
+        ::dup2(out[1], 2);
+        ::close(out[0]);
+        sock_filter f[] = {
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        };
+        sock_fprog prog{ (unsigned short)(sizeof f / sizeof f[0]), f };
+        if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+            ::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0)
+            ::_exit(3);
+        void* inst = nullptr;
+        const int a = r->init(bf16, 2, 0, 1, &inst);
+        const int b = r->init(f32, 2, 0, 1, &inst);
+        std::fflush(nullptr);
+        ::_exit(a == RAD_E_UNSUPPORTED && b == RAD_OK ? 0 : 1);
+    }
+    ::close(out[1]);
+    std::string said;
+    char buf[512];
+    for (ssize_t k; (k = ::read(out[0], buf, sizeof buf)) > 0;) said.append(buf, (size_t)k);
+    ::close(out[0]);
+    int ws = 0;
+    if (pid < 0 || ::waitpid(pid, &ws, 0) != pid || !WIFEXITED(ws)) {
+        std::printf("  %s: the child did not run to the end\n", what);
+        return false;
+    }
+    bool ok = true;
+    if (WEXITSTATUS(ws) == 3) {
+        std::printf("  %s, where io_uring is refused: SKIPPED -- no seccomp filter can be installed "
+                    "here\n", what);
+    } else if (WEXITSTATUS(ws) != 0 ||
+               said.find("--security-opt seccomp=unconfined") == std::string::npos) {
+        std::printf("  %s, where io_uring is refused: FAIL -- %s; it said: %s\n", what,
+                    WEXITSTATUS(ws) ? "the statuses were wrong" : "the reason was not named",
+                    said.c_str());
+        ok = false;
+    } else {
+        std::printf("  %s, where io_uring is refused: refused, naming the Docker option\n", what);
+    }
+
+    io_uring_params p{};
+    const long ring = syscall(__NR_io_uring_setup, 1, &p);
+    const bool here = ring >= 0;
+    if (here) ::close((int)ring);
+    void* inst = nullptr;
+    const int st = r->init(bf16, 2, 0, 1, &inst);
+    const bool right = here ? st == RAD_OK : st == RAD_E_UNSUPPORTED;
+    std::printf("  %s, in this process (io_uring %s): %s\n", what, here ? "available" : "refused",
+                right ? (here ? "accepted" : "refused") : "FAIL");
+    return ok && right;
+}
 
 bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool verbose,
                      bool bf16) {

@@ -109,8 +109,13 @@ struct OaiLimits {
     std::string model_id = "radiance";
     int64_t     max_ctx = 0;              /* 0 = unknown, no length check */
     /* What a request that names no max_tokens may generate. 0 is "whatever the context leaves",
-     * resolved against the prompt in clamp_max_tokens. */
-    int64_t     default_max_tokens = 512;
+     * resolved against the prompt in clamp_max_tokens, which needs max_ctx to resolve against.
+     *
+     * 0 BY DEFAULT, as vLLM's is: many clients send no max_tokens, and a reasoning model spends
+     * the first thousands of tokens of an answer thinking. A fixed default of 512 ended those
+     * answers inside the reasoning, with finish_reason "length" that a chat client does not show,
+     * so they read as a model that stops at random. */
+    int64_t     default_max_tokens = 0;
     /* The most any request may generate; a larger max_tokens is clamped, not refused. 0 = none. */
     int64_t     max_tokens_cap = 0;
     int         max_n = 8;

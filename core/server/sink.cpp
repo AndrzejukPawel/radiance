@@ -89,8 +89,9 @@ void Sink::finish(Finish f) {
     }
 }
 
-void Sink::fail(int rad_status) {
+void Sink::fail(int rad_status, const char* why) {
     status_.store(rad_status, std::memory_order_release);
+    why_.store(why, std::memory_order_release);
     finish(Finish::Error);
 }
 

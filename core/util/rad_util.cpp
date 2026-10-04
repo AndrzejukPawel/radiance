@@ -156,35 +156,35 @@ std::vector<std::string_view> split_ws(std::string_view s) {
  * touches this at declare, not per step. A hash map here would be slower and less predictable. */
 void Geometry::set_i(std::string_view k, long long v) {
     for (size_t i = 0; i < keys_.size(); ++i)
-        if (keys_[i] == k) { kinds_[i] = RAD_P_INT; ivals_[i] = v; dirty_ = true; return; }
+        if (keys_[i] == k) { kinds_[i] = RAD_P_INT; ivals_[i] = v; rebuild(); return; }
     keys_.emplace_back(k);
     svals_.emplace_back();
     ivals_.push_back(v);
     dvals_.push_back(0.0);
     kinds_.push_back(RAD_P_INT);
-    dirty_ = true;
+    rebuild();
 }
 
 void Geometry::set_f(std::string_view k, double v) {
     for (size_t i = 0; i < keys_.size(); ++i)
-        if (keys_[i] == k) { kinds_[i] = RAD_P_F64; dvals_[i] = v; dirty_ = true; return; }
+        if (keys_[i] == k) { kinds_[i] = RAD_P_F64; dvals_[i] = v; rebuild(); return; }
     keys_.emplace_back(k);
     svals_.emplace_back();
     ivals_.push_back(0);
     dvals_.push_back(v);
     kinds_.push_back(RAD_P_F64);
-    dirty_ = true;
+    rebuild();
 }
 
 void Geometry::set_s(std::string_view k, std::string_view v) {
     for (size_t i = 0; i < keys_.size(); ++i)
-        if (keys_[i] == k) { kinds_[i] = RAD_P_STR; svals_[i] = std::string(v); dirty_ = true; return; }
+        if (keys_[i] == k) { kinds_[i] = RAD_P_STR; svals_[i] = std::string(v); rebuild(); return; }
     keys_.emplace_back(k);
     svals_.emplace_back(v);
     ivals_.push_back(0);
     dvals_.push_back(0.0);
     kinds_.push_back(RAD_P_STR);
-    dirty_ = true;
+    rebuild();
 }
 
 bool Geometry::get_i(std::string_view k, long long* out) const {
@@ -210,10 +210,12 @@ bool Geometry::has(std::string_view k) const {
     return false;
 }
 
-void Geometry::rebuild() const {
-    auto* self = const_cast<Geometry*>(this);
-    self->view_.clear();
-    self->view_.reserve(keys_.size());
+/* Every key and every string value may have moved: an append can reallocate keys_ and svals_, and
+ * a short string lives inside its element. So the whole view is redone, which is the same handful
+ * of entries the setter's scan already walked. */
+void Geometry::rebuild() {
+    view_.clear();
+    view_.reserve(keys_.size());
     for (size_t i = 0; i < keys_.size(); ++i) {
         RadParam p{};
         p.key  = keys_[i].c_str();
@@ -221,13 +223,9 @@ void Geometry::rebuild() const {
         p.ival = ivals_[i];
         p.dval = dvals_[i];
         p.sval = kinds_[i] == RAD_P_STR ? svals_[i].c_str() : nullptr;
-        self->view_.push_back(p);
+        view_.push_back(p);
     }
-    dirty_ = false;
 }
-
-const RadParam* Geometry::params() const { if (dirty_) rebuild(); return view_.data(); }
-int             Geometry::n_params() const { if (dirty_) rebuild(); return (int)view_.size(); }
 
 std::string Geometry::str() const {
     std::string s;

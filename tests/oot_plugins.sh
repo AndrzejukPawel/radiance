@@ -119,10 +119,17 @@ say "4. the installed rad-kbench replays the fixture from the out-of-tree home: 
 # 5. The device library's machine code, against the tree's, object by object. A code object also
 # carries its compilation unit's ID, which clang hashes from the command line and the output path,
 # so two builds of one source never agree byte for byte; their instructions (.text) and kernel
-# descriptors (.rodata) do, unless the flags that reach the device compiler differ.
+# descriptors do, unless the flags that reach the device compiler differ.
+#
+# THE DESCRIPTORS ARE COMPARED BY NAME, NOT AS .rodata's BYTES. The compiler lays them out in an
+# order that changes from one run of the same command to the next -- ROCm 7's clang does it to the
+# eight instances of the template in r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip -- and each holds
+# its kernel's entry as an offset from itself, so the section's bytes differ while every kernel and
+# every descriptor is the same. Each descriptor is read by its symbol, its entry resolved to the
+# address in .text it names, and the rest of .rodata is compared with the descriptors blanked.
 if [ -n "$HIPC" ]; then
   L=$(dirname "$HIPC")
-  for t in llvm-objcopy clang-offload-bundler; do
+  for t in llvm-objcopy llvm-readelf clang-offload-bundler; do
     [ -x "$L/$t" ] || fail "no $t beside $HIPC"
   done
   td="$B/libr4d/CMakeFiles/libr4d.dir"
@@ -131,15 +138,34 @@ if [ -n "$HIPC" ]; then
   fatbin() {   # fatbin OBJ -- its fat binary into $W/co/fb; false for a source with no kernels
     "$L/llvm-objcopy" --dump-section .hip_fatbin="$W/co/fb" "$1" /dev/null 2>/dev/null
   }
-  code() {     # code OBJ TARGET -- checksums of that target's instructions and kernel descriptors
+  descriptors() {   # descriptors CO RODATA -- each descriptor by name; blanks it in RODATA
+    set -- "$1" "$2" $("$L/llvm-readelf" -SW "$1" |
+                       awk '{ for (i = 1; i < NF; ++i) if ($i == ".rodata") print $(i + 2), $(i + 3) }')
+    [ $# -eq 4 ] || return 0
+    base=$((0x$3)); foff=$((0x$4))
+    "$L/llvm-readelf" -sW "$1" | awk '$4 == "OBJECT" && $8 ~ /\.kd$/ { print $2, $3, $8 }' |
+      sort -u -k3 |
+      while read -r val size name; do
+        a=$((0x$val)); o=$((foff + a - base))
+        e=$(od -An -t d8 -j $((o + 16)) -N 8 "$1" | tr -d ' ')
+        printf '%s %s entry=%x %s %s\n' "$name" "$size" $((a + e)) \
+          "$(od -An -v -t x1 -j "$o" -N 16 "$1" | tr -d ' \n')" \
+          "$(od -An -v -t x1 -j $((o + 24)) -N $((size - 24)) "$1" | tr -d ' \n')"
+        dd if=/dev/zero of="$2" bs=1 seek=$((a - base)) count="$size" conv=notrunc 2>/dev/null
+      done
+  }
+  code() {     # code OBJ TARGET -- checksums of that target's instructions, its descriptors by
+               # name, and the rest of its read-only data
     fatbin "$1"
     "$L/clang-offload-bundler" --type=o --input="$W/co/fb" --unbundle --targets="$2" \
         --output="$W/co/co"
     for sec in .text .rodata; do
-      "$L/llvm-objcopy" --dump-section "$sec=$W/co/sec" "$W/co/co" /dev/null 2>/dev/null ||
-        : > "$W/co/sec"
-      cksum < "$W/co/sec"
+      "$L/llvm-objcopy" --dump-section "$sec=$W/co/$sec" "$W/co/co" /dev/null 2>/dev/null ||
+        : > "$W/co/$sec"
     done
+    cksum < "$W/co/.text"
+    descriptors "$W/co/co" "$W/co/.rodata" | cksum
+    cksum < "$W/co/.rodata"
   }
   [ "$(ls "$td"/*.hip.o | wc -l)" = "$(ls "$od"/*.hip.o | wc -l)" ] ||
     fail "libr4d compiles a different set of HIP sources out of tree"

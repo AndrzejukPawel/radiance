@@ -687,8 +687,9 @@ struct Config {
                          sample_dry_penalty_last_n;
     std::optional<std::vector<std::string>> sample_dry_seq_breakers;
 
-    /* --default-max-tokens: what a request that names no max_tokens may generate. -1 is unset
-     * (the server's 512), 0 is `auto` (whatever the context leaves after the prompt). */
+    /* --default-max-tokens: what a request that names no max_tokens may generate. -1 is unset,
+     * which is the server's default, `auto`; 0 is `auto` stated (whatever the context leaves after
+     * the prompt). */
     int64_t default_max_tokens = -1;
     /* --max-tokens-cap: the most any request may generate. A larger max_tokens is clamped to it,
      * the way the context clamps one, and the reply ends with finish_reason "length". 0 is none. */

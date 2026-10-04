@@ -1228,7 +1228,7 @@ static double seconds_to(const std::function<void()>& f, int reps = 3) {
 }
 
 static double stream_bytes(const ReplyParser& p, const std::string& text, size_t piece,
-                           std::vector<double>* per_call = nullptr) {
+                           std::vector<double>* per_call = nullptr, int reps = 3) {
     return seconds_to([&] {
         std::unique_ptr<ReplyStream> s = p.open();
         std::vector<ReplyEvent> ev;
@@ -1240,7 +1240,7 @@ static double stream_bytes(const ReplyParser& p, const std::string& text, size_t
             ev.clear();
         }
         s->finish(&ev);
-    }, per_call ? 1 : 3);
+    }, per_call ? 1 : reps);
 }
 
 TEST(a_long_reply_streamed_byte_by_byte_costs_a_constant_factor_of_parsing_it_once) {
@@ -1264,16 +1264,25 @@ TEST(a_long_reply_streamed_byte_by_byte_costs_a_constant_factor_of_parsing_it_on
     }
 }
 
-TEST(twice_the_reply_costs_twice_the_time) {
+/* FOUR TIMES THE REPLY COSTS FOUR TIMES THE TIME, and a quadratic path sixteen: the bound of 8 sits
+ * a factor of two from each. The two sizes are timed in turns, best of five each, so a burst of load
+ * from whatever else the machine runs lands on both: timed one size after the other, best of three,
+ * a 2x step read x3.9 beside three other test binaries and a server, against the 4 a quadratic
+ * path gives. */
+TEST(four_times_the_reply_costs_four_times_the_time) {
     for (const Model& m : models()) {
         Bench* b = bench(m, ChatRequest{});
         if (!b) continue;
-        const std::string a = long_reply(m, 200 * 1024), c = long_reply(m, 400 * 1024);
-        const double ta = stream_bytes(b->parser(), a, 1), tc = stream_bytes(b->parser(), c, 1);
+        const std::string a = long_reply(m, 100 * 1024), c = long_reply(m, 400 * 1024);
+        double ta = 1e30, tc = 1e30;
+        for (int rep = 0; rep < 5; ++rep) {
+            ta = std::min(ta, stream_bytes(b->parser(), a, 1, nullptr, 1));
+            tc = std::min(tc, stream_bytes(b->parser(), c, 1, nullptr, 1));
+        }
         const double ratio = tc / ta;
         fprintf(stderr, "    %s: %zu -> %zu bytes byte by byte: %.3f -> %.3f ms (x%.2f)\n",
                 m.name.c_str(), a.size(), c.size(), ta * 1e3, tc * 1e3, ratio);
-        CHECK(ratio < 3.0);
+        CHECK(ratio < 8.0);
     }
 }
 

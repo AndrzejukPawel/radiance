@@ -79,7 +79,9 @@ public:
     /* Terminal. Idempotent -- the first call wins, so a cancel racing a natural stop does not
      * produce two finish reasons. */
     void finish(Finish f);
-    void fail(int rad_status);
+    /* `why` says what failed, in a sentence a client can read; a string that outlives the sink
+     * (a literal), or null. */
+    void fail(int rad_status, const char* why = nullptr);
 
     /* The scheduler polls this to learn that the client hung up, and frees the blocks (spec §14).
      * It is also told by IScheduler::cancel(); this is the cheap path that needs no lookup. */
@@ -100,6 +102,7 @@ public:
     bool   done() const { return finish_.load(std::memory_order_acquire) != (int)Finish::None; }
     Finish finish_reason() const { return (Finish)finish_.load(std::memory_order_acquire); }
     int    status() const { return status_.load(std::memory_order_acquire); }
+    const char* why() const { return why_.load(std::memory_order_acquire); }
     bool   overflowed() const { return overflow_.load(std::memory_order_acquire); }
 
     /* The HTTP thread calls this when the peer disappears. It does NOT free anything itself --
@@ -135,6 +138,7 @@ private:
 
     std::atomic<int>      finish_{(int)Finish::None};
     std::atomic<int>      status_{RAD_OK};
+    std::atomic<const char*> why_{nullptr};
     std::atomic<bool>     overflow_{false};
     std::atomic<bool>     cancel_{false};
     std::atomic<bool>     quiesced_{false};   /* the producer will not touch this object again */
@@ -159,8 +163,8 @@ inline bool sink_push(void* s, int32_t token, float logprob = 0.0f) {
 inline void sink_finish(void* s, Finish f) {
     if (s) static_cast<Sink*>(s)->finish(f);
 }
-inline void sink_fail(void* s, int rad_status) {
-    if (s) static_cast<Sink*>(s)->fail(rad_status);
+inline void sink_fail(void* s, int rad_status, const char* why = nullptr) {
+    if (s) static_cast<Sink*>(s)->fail(rad_status, why);
 }
 inline bool sink_cancelled(const void* s) {
     return s && static_cast<const Sink*>(s)->cancel_requested();

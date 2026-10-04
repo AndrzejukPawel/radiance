@@ -100,40 +100,46 @@ class Geometry {
 public:
     Geometry() = default;
 
-    /* The cached RadParam view holds char* into THIS object's own strings. An implicit copy would
-     * carry those pointers into the copy along with dirty_ = false, so the copy would hand a
-     * kernel pointers that dangle the moment the source dies -- and every Resolved holds a
-     * Geometry while every Band holds two, so this type is copied constantly. A copy therefore
-     * takes the storage and NOT the view, and rebuilds on first use.
+    /* THE RadParam VIEW IS KEPT CURRENT BY EVERY WRITE, never built on first read. It holds char*
+     * into this object's own strings, and a view rebuilt lazily from a const reader is a write
+     * that two readers can make at once: the sizing declares of one rank all read the real
+     * program's geometries side by side (Engine::probe_arena_levels), and one clearing the view
+     * while another filled it is the heap corruption that crashed startup. So params() writes
+     * nothing, and a Geometry nobody is writing can be read from any number of threads.
      *
-     * The move is the same rule for a different reason: a moved-from vector's buffer may be
-     * stolen, so the view's pointers stop meaning anything even though nothing was destroyed. */
+     * A copy takes the storage and builds its own view, because the source's points into the
+     * source. A move takes the view along with the storage: the vectors hand over their arrays,
+     * so every string stays where it was and every pointer stays good. The moved-from object is
+     * emptied, view included, so it is a valid empty geometry rather than one whose view names
+     * strings it no longer owns. */
     Geometry(const Geometry& o)
-        : keys_(o.keys_), svals_(o.svals_), ivals_(o.ivals_), dvals_(o.dvals_), kinds_(o.kinds_) {}
+        : keys_(o.keys_), svals_(o.svals_), ivals_(o.ivals_), dvals_(o.dvals_), kinds_(o.kinds_) {
+        rebuild();
+    }
 
     Geometry& operator=(const Geometry& o) {
         if (this != &o) {
             keys_ = o.keys_; svals_ = o.svals_; ivals_ = o.ivals_; dvals_ = o.dvals_;
             kinds_ = o.kinds_;
-            view_.clear(); dirty_ = true;
+            rebuild();
         }
         return *this;
     }
 
     Geometry(Geometry&& o) noexcept
         : keys_(std::move(o.keys_)), svals_(std::move(o.svals_)),
-          ivals_(std::move(o.ivals_)), dvals_(std::move(o.dvals_)),
-          kinds_(std::move(o.kinds_)) {
-        o.view_.clear(); o.dirty_ = true;
+          view_(std::move(o.view_)), ivals_(std::move(o.ivals_)),
+          dvals_(std::move(o.dvals_)), kinds_(std::move(o.kinds_)) {
+        o.clear();
     }
 
     Geometry& operator=(Geometry&& o) noexcept {
         if (this != &o) {
             keys_ = std::move(o.keys_); svals_ = std::move(o.svals_);
+            view_ = std::move(o.view_);
             ivals_ = std::move(o.ivals_); dvals_ = std::move(o.dvals_);
             kinds_ = std::move(o.kinds_);
-            view_.clear(); dirty_ = true;
-            o.view_.clear(); o.dirty_ = true;
+            o.clear();
         }
         return *this;
     }
@@ -149,17 +155,20 @@ public:
     const char* get_s(std::string_view k) const;
     bool has(std::string_view k) const;
 
-    /* A view suitable for RadArgs.p. Valid while this object lives. */
-    const RadParam* params() const;
-    int             n_params() const;
+    /* A view suitable for RadArgs.p. Valid while this object lives and is not written. */
+    const RadParam* params() const { return view_.data(); }
+    int             n_params() const { return (int)view_.size(); }
 
     std::string str() const;      /* "M=64 N=8192 K=5120 dtype=w4a8", for diagnostics */
 
 private:
     std::vector<std::string> keys_, svals_;
     std::vector<RadParam>    view_;
-    mutable bool             dirty_ = true;
-    void rebuild() const;
+    void rebuild();
+    void clear() noexcept {
+        keys_.clear(); svals_.clear(); view_.clear(); ivals_.clear(); dvals_.clear();
+        kinds_.clear();
+    }
     std::vector<long long>   ivals_;
     std::vector<double>      dvals_;
     std::vector<int>         kinds_;

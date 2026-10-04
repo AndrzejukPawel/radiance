@@ -165,6 +165,14 @@ public:
      * laid over the real ones. */
     void set_reference(const Program* ref) { ref_ = ref; }
 
+    /* WITHOUT INSTANCES: finish() selects every kernel and initialises none. For a caller that
+     * launches nothing -- rad-convert plans a container's stored form, which is the kernels'
+     * layouts and not their setup. A kernel's init is about the process it runs in (a ring, a
+     * peer's buffers) and the conversion is often not that process: libavx's n-gram gather
+     * refuses a process that may not make an io_uring ring, and a sandbox that forbids one still
+     * has to be able to convert the model. */
+    void set_instances(bool on) { instances_ = on; }
+
     Program&       program()       { return prog_; }
     const Program& program() const { return prog_; }
 
@@ -195,6 +203,7 @@ private:
     Registry& reg_;
     Program prog_;
     const Program* ref_ = nullptr;
+    bool instances_ = true;
 
     std::vector<std::string> errors_;
     int  status_ = RAD_OK;

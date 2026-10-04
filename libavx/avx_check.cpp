@@ -802,6 +802,8 @@ static bool schema_same(const RadOpSchema& a, const RadOpSchema& b, std::string*
 /* embed_lookup_q over a file-backed table, two ranks and the reader racing (avx_check_rows.cpp). */
 bool row_gather_case(const Lib& avx, const std::string& dir, int64_t calls, bool verbose,
                      bool bf16);
+/* embed_lookup_q's init, where io_uring is refused and here (avx_check_rows.cpp). */
+bool ngram_init_case(const Lib& avx);
 
 int main(int argc, char** argv) {
     std::string ref_path = "libref.so", avx_path = "libavx.so", only_op;
@@ -885,6 +887,12 @@ int main(int argc, char** argv) {
     }
 
     int rc = missing ? 1 : 0;
+    /* Before anything runs a gather: the case forks, and a child is cleanest taken from a process
+     * that has started none of the gather's threads. */
+    if (only_op.empty() || only_op == "embed_lookup_q") {
+        std::printf("\n");
+        if (!ngram_init_case(avx)) rc = 1;
+    }
     const int lo = only_level >= 0 ? only_level : 0;
     const int hi = only_level >= 0 ? only_level : AVX_N_LEVELS - 1;
     std::vector<std::string> declined_ops;

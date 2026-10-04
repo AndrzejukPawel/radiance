@@ -127,7 +127,7 @@ static const Flag g_flags[] = {
     { "--dry-sequence-breakers", "JSON", "default dry_sequence_breakers, a JSON array of at most 16 strings" },
     { "--xtc-probability",    "F",      "default xtc_probability, [0, 1]" },
     { "--xtc-threshold",      "F",      "default xtc_threshold, [0, 1]" },
-    { "--default-max-tokens", "N",      "max_tokens for requests that do not set one (default 512). `auto` is\n"
+    { "--default-max-tokens", "N",      "max_tokens for requests that do not set one: N, or `auto` (default),\n"
     "                                    whatever the context leaves after the prompt" },
     { "--max-tokens-cap",     "N",      "the most any request may generate. A larger max_tokens is cut to it rather\n"
     "                                    than refused, and the reply ends with finish_reason \"length\". 0 is none\n"

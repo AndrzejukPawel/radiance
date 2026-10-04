@@ -14,7 +14,10 @@
 
 #include "rad_internal.h"
 
+#include <atomic>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace rad;
 
@@ -162,8 +165,8 @@ TEST(the_param_view_is_rebuilt_after_a_mutation) {
     CHECK_EQ(g.n_params(), 1);
     CHECK_EQ(g.params()[0].ival, 8ll);
 
-    /* The view is cached, so the question is whether the cache is invalidated. A stale view hands
-     * a kernel the geometry it was resolved against rather than the one it is being run on. */
+    /* The view is built by the writes, so the question is whether every write rebuilds it. A stale
+     * view hands a kernel the geometry it was resolved against rather than the one it is run on. */
     g.set_i("M", 9);
     CHECK_EQ(g.params()[0].ival, 9ll);
     g.set_i("N", 4096);
@@ -186,15 +189,15 @@ TEST(the_param_view_is_rebuilt_after_a_mutation) {
     CHECK_EQ(seen, 1);
 }
 
-/* THE COPY MUST OWN ITS OWN STRINGS, and the header says why at length: the cached view holds
- * char* into the object's own storage, so a copy that took the view along with the storage would
+/* THE COPY MUST OWN ITS OWN STRINGS, and the header says why at length: the view holds char*
+ * into the object's own storage, so a copy that took the view along with the storage would
  * hand a kernel pointers into the source -- which dies first about as often as not, since every
  * Resolved holds a Geometry and every Band holds two. */
 TEST(a_copied_geometry_points_into_itself_and_not_at_the_source) {
     Geometry a;
     a.set_s("dtype", "w4a8");
     a.set_i("M", 64);
-    const char* a_key = a.params()[0].key;         /* force the source to build its view */
+    const char* a_key = a.params()[0].key;
 
     Geometry b = a;
     CHECK_EQ(b.n_params(), 2);
@@ -202,6 +205,7 @@ TEST(a_copied_geometry_points_into_itself_and_not_at_the_source) {
     CHECK(b.params()[0].key != a_key);             /* a different object's storage */
     CHECK(b.params()[0].sval != a.params()[0].sval);
     CHECK_EQ(std::string(b.params()[0].sval), std::string("w4a8"));
+    CHECK(b.params()[0].sval == b.get_s("dtype"));  /* and into the copy's own string */
 
     /* And the two are independent afterwards, in both directions. */
     a.set_i("M", 1);
@@ -225,11 +229,12 @@ TEST(a_moved_geometry_does_not_leave_the_view_pointing_at_a_stolen_buffer) {
     Geometry a;
     a.set_s("dtype", "fp8");
     a.set_i("K", 5120);
-    (void)a.params();                              /* build the view, then move out from under it */
 
     Geometry b = std::move(a);
     CHECK_EQ(b.n_params(), 2);
     CHECK_EQ(std::string(b.params()[0].sval), std::string("fp8"));
+    CHECK(b.params()[0].sval == b.get_s("dtype"));  /* the view went with the strings it names */
+    CHECK_EQ(std::string(b.params()[0].key), std::string("dtype"));
     /* The moved-from object is empty rather than holding a view of a buffer it no longer owns. */
     CHECK_EQ(a.n_params(), 0);
 
@@ -239,6 +244,49 @@ TEST(a_moved_geometry_does_not_leave_the_view_pointing_at_a_stolen_buffer) {
     CHECK_EQ(c.n_params(), 2);
     CHECK(!c.has("x"));
     CHECK_EQ(b.n_params(), 0);
+}
+
+/* READING A GEOMETRY WRITES NOTHING, so one that nobody is writing can be read from any number of
+ * threads. The sizing declares of one rank run side by side and every one of them reads the real
+ * program's op geometries (Engine::probe_arena_levels); a view built lazily on first read was a
+ * write each of them made, and two threads clearing and filling one vector corrupted the heap at
+ * startup. Each round reads a fresh geometry -- a moved one, as every OpInfo's is -- from eight
+ * threads released together, and every reader must see the whole view and the same one. */
+TEST(a_geometry_read_from_many_threads_at_once_is_not_written) {
+    constexpr int kThreads = 8, kRounds = 400;
+    int bad = 0;
+    for (int round = 0; round < kRounds && bad == 0; ++round) {
+        Geometry src;
+        src.set_s("dtype", "fp8_e4m3_with_a_name_past_the_short_string_buffer");
+        for (int k = 0; k < 12; ++k) src.set_i(fmt("key_%d", k), k * 1000 + round);
+        const Geometry g = std::move(src);
+
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<const RadParam*> seen(kThreads, nullptr);
+        std::vector<int> ok(kThreads, 0);
+        std::vector<std::thread> th;
+        for (int t = 0; t < kThreads; ++t)
+            th.emplace_back([&, t] {
+                ready.fetch_add(1);
+                while (!go.load()) {}
+                const RadParam* p = g.params();
+                const int n = g.n_params();
+                bool good = n == 13 && std::string(p[0].key) == "dtype" && p[0].sval &&
+                            std::string(p[0].sval).rfind("fp8_e4m3", 0) == 0;
+                for (int k = 0; good && k < 12; ++k)
+                    good = p[k + 1].kind == RAD_P_INT && p[k + 1].ival == k * 1000 + round &&
+                           std::string(p[k + 1].key) == fmt("key_%d", k);
+                seen[t] = p;
+                ok[t] = good;
+            });
+        while (ready.load() < kThreads) {}
+        go.store(true);
+        for (auto& x : th) x.join();
+        for (int t = 0; t < kThreads; ++t)
+            if (!ok[t] || seen[t] != seen[0]) ++bad;
+    }
+    CHECK_EQ(bad, 0);
 }
 
 TEST(geometry_str_prints_every_kind_in_declaration_order) {

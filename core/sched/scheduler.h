@@ -238,8 +238,9 @@ public:
 
     /* THE ENGINE HAS STOPPED AND WILL RUN NO MORE STEPS. Every request still queued or running is
      * failed with `reason` so its connection is answered rather than left waiting on a step that
-     * will never come, and any request submitted afterwards is refused the same way. */
-    void     shutdown(const char* reason);
+     * will never come, and any request submitted afterwards is refused the same way. `status` is
+     * what stopped it, and what each of those requests reports. */
+    void     shutdown(const char* reason, int status = RAD_E_STATE);
 
     /* The waiting queue in SERVICE order, by request id -- what the live view shows and what a
      * test asserts a preempted request re-entered at the front of. Returns how many were written. */
@@ -522,6 +523,7 @@ private:
     /* Set by shutdown(); add() refuses from then on. */
     bool     closed_ = false;
     const char* closed_reason_ = "";
+    int      closed_status_ = RAD_E_STATE;
 
     /* THE LONGEST SEQUENCE THIS DEPLOYMENT CAN ADDRESS, prompt and output together. The batch
      * builder sizes its block tables for it and the rotary tables are this long, so no position
@@ -631,9 +633,13 @@ private:
 
     /* lifecycle */
     /* `publish` is false only when the engine is shutting down: a sequence the device may have
-     * left half-computed is not worth indexing, and nothing will ever hit it. */
+     * left half-computed is not worth indexing, and nothing will ever hit it.
+     *
+     * A FAILED REQUEST SAYS WHAT FAILED: its sink is failed with `status` and `why`, which the
+     * server puts in the error the client gets. RAD_OK leaves a sink that has failed already (an
+     * overflow) as it is. */
     void close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free = false,
-                       bool publish = true);
+                       bool publish = true, int status = RAD_OK, const char* why = nullptr);
     /* What reap() does once nothing points at the slot any more: give the blocks back, forget the
      * id, destroy the Request and return the slot. Called by reap() directly, or by the sweep in
      * commit() for a request whose reap arrived while something still pointed at it. */

@@ -88,10 +88,13 @@ const RadChatFormat* rad_tools_chat_format(const LoadedPlugins& plugins, const R
  * or initialised. The Program that comes back is for its buffers and nothing else. */
 /* `sources` answers rad_weight_encoding (Builder::set_sources): a container's entries, a
  * checkpoint's tensors, or a recipe. Empty, every weight is read as plain in its declared dtype. */
+/* `instances` false selects every kernel and initialises none (Builder::set_instances): for a
+ * caller that launches nothing, such as rad-convert planning a container's stored form. */
 int rad_tools_declare(const LoadedPlugins& plugins, const RadModelMeta& meta,
                       const RadBuildCtx& ctx, Program* out,
                       const std::function<int(RadBuilder*, int64_t logits_width)>& also = {},
-                      const Program* ref = nullptr, const WeightSourceFn& sources = {});
+                      const Program* ref = nullptr, const WeightSourceFn& sources = {},
+                      bool instances = true);
 
 /* A container's entries as the source of every declaration's encoding. `f` must outlive the
  * declare. */

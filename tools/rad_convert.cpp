@@ -566,7 +566,8 @@ int main(int argc, char** argv) {
     for (size_t k = 0; k < widths.size(); ++k) {
         Program trial;
         ctx.kv_dtype = widths[k];
-        if (rad_tools_declare(plugins, meta.m, ctx, &trial, {}, nullptr, provide) < 0) {
+        if (rad_tools_declare(plugins, meta.m, ctx, &trial, {}, nullptr, provide,
+                              /*instances=*/false) < 0) {
             if (planning_errors())
                 RAD_ERR("the weights above could not be planned, and declare saw each of them as "
                         "the plain dtype it was declared at -- fix those first");
