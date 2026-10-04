@@ -9,7 +9,7 @@ below are for **two 32 GB cards** (Radeon AI PRO R9700). The engine itself start
 family; another card needs a kernel library for it. A machine with no GPU builds the host backend,
 which runs the full test suite but does not serve these models at any useful speed.
 
-If you wish to support the developement of the radiance engine you can do so at https://patreon.com/StillDeadCode?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink
+If you wish to support the developement of the radiance engine you can do so [here](https://patreon.com/StillDeadCode?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink)
 
 ## Models
 
